@@ -149,6 +149,27 @@ The upload engine communicates directly with Google's mobile upload endpoints us
 
 ### Linux Quick Start
 
+[](#linux-quick-start)
+
+#### Immich Integration (Optional)
+
+If you use [Immich](https://immich.app/) to manage your photo backup, GoogleUnlimited
+can tag assets in Immich once they are backed up to Google Photos, and skip assets
+that already carry that tag (preventing re-uploads after a database reset).
+
+1. In the Immich web UI: **Account Settings → API Keys → New API Key**.
+2. Create `immich.config` in the repository root (chmod 600 is applied automatically; it is gitignored):
+
+```
+GU_IMMICH_URL=http://localhost:2283
+GU_IMMICH_API_KEY=<your-immich-api-key>
+GU_IMMICH_TAG=gphotos-uploaded
+```
+
+- After every successful Google Photos upload, the matching Immich asset is tagged `gphotos-uploaded` (configurable).
+- Files whose Immich asset already carries the tag are skipped by the watcher (set `GU_IMMICH_CHECK=0` to disable).
+- Tagging is non-fatal: if Immich is unreachable, uploads continue and are simply not tagged until the next file sync.
+
 1. **Clone the repository**:
    ```bash
    git clone https://github.com/shishir0x/GoogleUnlimited.git
