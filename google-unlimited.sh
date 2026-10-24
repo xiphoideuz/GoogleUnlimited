@@ -23,14 +23,17 @@ GU_DAILY_CAP="${GU_DAILY_CAP:-0}"
 GU_DRY_RUN="${GU_DRY_RUN:-0}"
 
 # Immich API integration (optional, configured via immich.config or environment)
-#   GU_IMMICH_URL     : Immich server base URL, e.g. http://localhost:2283
-#   GU_IMMICH_API_KEY : Immich API key (Immich web UI -> Account Settings -> API Keys)
-#   GU_IMMICH_TAG     : tag name applied to assets that were uploaded to Google Photos
-#   GU_IMMICH_CHECK   : 1 = skip files whose Immich asset already carries the tag
+#   GU_IMMICH_URL      : Immich server base URL, e.g. http://localhost:2283
+#   GU_IMMICH_API_KEY  : Immich API key (Immich web UI -> Account Settings -> API Keys)
+#   GU_IMMICH_TAG      : tag name applied to assets that were uploaded to Google Photos
+#   GU_IMMICH_CHECK    : 1 = skip files whose Immich asset already carries the tag
+#   GU_IMMICH_PATH_MAP : host_path:container_path mapping, e.g. /mnt/nas/immich/upload:/data
+#                        (Immich stores/returns asset paths as seen INSIDE its container.)
 GU_IMMICH_URL="${GU_IMMICH_URL:-}"
 GU_IMMICH_API_KEY="${GU_IMMICH_API_KEY:-}"
 GU_IMMICH_TAG="${GU_IMMICH_TAG:-gphotos-uploaded}"
 GU_IMMICH_CHECK="${GU_IMMICH_CHECK:-1}"
+GU_IMMICH_PATH_MAP="${GU_IMMICH_PATH_MAP:-}"
 
 load_immich_config() {
     local cfg="$SCRIPT_DIR/immich.config"
@@ -43,12 +46,27 @@ load_immich_config() {
             GU_IMMICH_API_KEY) GU_IMMICH_API_KEY="$(echo "$v" | tr -d '"' | xargs)" ;;
             GU_IMMICH_TAG)     GU_IMMICH_TAG="$(echo "$v" | tr -d '"' | xargs)" ;;
             GU_IMMICH_CHECK)   GU_IMMICH_CHECK="$(echo "$v" | tr -d '"' | xargs)" ;;
+            GU_IMMICH_PATH_MAP) GU_IMMICH_PATH_MAP="$(echo "$v" | tr -d '"' | xargs)" ;;
         esac
     done < "$cfg"
 }
 
 immich_configured() {
     [ -n "$GU_IMMICH_URL" ] && [ -n "$GU_IMMICH_API_KEY" ]
+}
+
+# Map a host filesystem path to the path Immich uses inside its container.
+immich_map_path() {
+    local fpath="$1"
+    if [[ "$GU_IMMICH_PATH_MAP" == *:* ]]; then
+        local host_part="${GU_IMMICH_PATH_MAP%%:*}"
+        local container_part="${GU_IMMICH_PATH_MAP#*:}"
+        if [[ "$fpath" == "$host_part"* ]]; then
+            printf '%s' "${container_part%/}${fpath#"$host_part"}"
+            return 0
+        fi
+    fi
+    printf '%s' "$fpath"
 }
 
 immich_api() {
@@ -71,9 +89,6 @@ immich_json_get() {
         echo ""
         return 0
     fi
-    if command -v jq >/dev/null 2>&1; then
-        : # jq handled inline by callers; normalisation via python only
-    fi
     if ! command -v python3 >/dev/null 2>&1; then
         echo ""
         return 0
@@ -81,60 +96,133 @@ immich_json_get() {
     printf '%s' "$json" | python3 -c "$filter" 2>/dev/null || true
 }
 
+# Search Immich assets by file name and resolve the one matching our copied file.
+# Resolution order: exact mapped-path match -> /library/ relative suffix match
+#                   -> unique basename match -> filename + file size match.
+# The mapping matters because Immich returns paths as seen INSIDE its container,
+# so watch_dirs paths are translated via GU_IMMICH_PATH_MAP (host:container).
 immich_find_asset_id() {
     local fpath="$1" fname="$2"
-    local resp
-    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"originalPath\":\"${fpath//\"/\\\"}\",\"withArchived\":true,\"take\":100}")"
-    immich_json_get "$resp" '
+    local size_bytes="${3:-0}"
+    local mapped_path rel_suffix resp
+    mapped_path="$(immich_map_path "$fpath")"
+    rel_suffix=""
+    if [[ "$mapped_path" == */library/* ]]; then
+        rel_suffix="${mapped_path#*/library/}"
+    fi
+    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"withArchived\":true,\"take\":200}")"
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$resp" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-target = sys.argv[1] if len(sys.argv) > 1 else None
+assets = d.get("assets") or {}
+if isinstance(assets, dict):
+    assets = assets.get("items", [])
+assets = [a for a in (assets or []) if a.get("originalPath")]
+
+def get_size(a):
+    try:
+        return int(((a.get("exifInfo") or {}).get("fileSizeInByte")) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+target = (sys.argv + [""])[1]
+rel = (sys.argv + ["", ""])[2]
+name = (sys.argv + ["", "", ""])[3]
+size = (sys.argv + ["", "", "", "0"])[4]
+
 if target:
-    for a in d.get("assets", []):
+    for a in assets:
         if a.get("originalPath") == target:
-            print(a.get("id", "")); break
-' "$fpath"
+            print(a["id"]); sys.exit(0)
+if rel:
+    for a in assets:
+        p = a.get("originalPath", "")
+        if "/library/" in p and p.split("/library/", 1)[1] == rel:
+            print(a["id"]); sys.exit(0)
+by_name = [a for a in assets if a.get("originalFileName") == name]
+if len(by_name) == 1:
+    print(by_name[0]["id"]); sys.exit(0)
+try:
+    size = int(size)
+except ValueError:
+    size = 0
+if size:
+    by_size = [a for a in by_name if get_size(a) == size]
+    if len(by_size) == 1:
+        print(by_size[0]["id"])
+' "$mapped_path" "$rel_suffix" "$fname" "$size_bytes"
+    elif command -v jq >/dev/null 2>&1; then
+        printf '%s' "$resp" | jq -r --arg t "$mapped_path" '
+            ([(.assets.items // .assets // [])[] | select(.originalPath == $t)][0].id)
+            // ([(.assets.items // .assets // [])[] | select(.originalPath is not null)] | length) as $n
+            | empty
+        ' 2>/dev/null | head -1
+        # jq fallback above handles only the common exact-path case
+    fi
 }
 
 immich_asset_has_tag() {
     local fpath="$1" fname="$2"
-    local resp
-    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"originalPath\":\"${fpath//\"/\\\"}\",\"withArchived\":true,\"take\":100}")"
-    immich_json_get "$resp" '
+    local mapped_path rel_suffix resp
+    mapped_path="$(immich_map_path "$fpath")"
+    rel_suffix=""
+    if [[ "$mapped_path" == */library/* ]]; then
+        rel_suffix="${mapped_path#*/library/}"
+    fi
+    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"withArchived\":true,\"take\":200}")"
+    local result=1
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$resp" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-target = sys.argv[1]
-tagname = sys.argv[2] if len(sys.argv) > 2 else ""
-for a in d.get("assets", []):
-    if a.get("originalPath") != target:
-        continue
-    for t in a.get("tags", []) or []:
-        if t.get("name") == tagname:
-            print("1"); sys.exit(0)
-sys.exit(0)
-' "$fpath" "$GU_IMMICH_TAG"
+assets = d.get("assets") or {}
+if isinstance(assets, dict):
+    assets = assets.get("items", [])
+target = (sys.argv + [""])[1]
+rel = (sys.argv + ["", ""])[2]
+tagname = (sys.argv + ["", "", ""])[3]
+def wanted(a):
+    p = a.get("originalPath", "")
+    if target and p == target:
+        return True
+    if rel and "/library/" in p and p.split("/library/", 1)[1] == rel:
+        return True
+    return False
+for a in (assets or []):
+    if wanted(a):
+        for t in a.get("tags", []) or []:
+            if t.get("name") == tagname:
+                print("1"); sys.exit(0)
+' "$mapped_path" "$rel_suffix" "$GU_IMMICH_TAG" | grep -q "^1$" && result=0
+    elif command -v jq >/dev/null 2>&1; then
+        printf '%s' "$resp" | jq -r --arg t "$mapped_path" --arg g "$GU_IMMICH_TAG" '
+            ([(.assets.items // .assets // [])[] | select(.originalPath == $t)] | .[0].tags // []) 
+            | map(select(.name == $g)) | length > 0
+        ' 2>/dev/null | grep -q true && result=0
+    fi
+    return $result
 }
-
 immich_get_or_create_tag_id() {
-    local resp
+    local resp tag_id
     resp="$(immich_api GET /api/tags)"
-    local tag_id
     tag_id="$(immich_json_get "$resp" '
 import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
     sys.exit(0)
-tagname = sys.argv[1]
-for t in d or []:
+tagname = (sys.argv + [""])[1]
+for t in (d or []):
     if isinstance(t, dict) and t.get("name") == tagname:
-        print(t.get("id", "")); break
+        print(t.get("id", ""))
+        break
 ' "$GU_IMMICH_TAG")"
     if [ -n "$tag_id" ]; then
         echo "$tag_id"
@@ -157,8 +245,9 @@ immich_mark_uploaded() {
     if ! immich_configured; then
         return 0
     fi
-    local fname
+    local fname size_bytes
     fname="$(basename "$fpath")"
+    size_bytes="$(stat -c%s "$fpath" 2>/dev/null || echo 0)"
 
     if [ "$GU_DRY_RUN" = "1" ]; then
         echo "             [DRYRUN] Would tag Immich asset: $GU_IMMICH_TAG"
@@ -167,7 +256,7 @@ immich_mark_uploaded() {
     fi
 
     local asset_id tag_id
-    asset_id="$(immich_find_asset_id "$fpath" "$fname")"
+    asset_id="$(immich_find_asset_id "$fpath" "$fname" "$size_bytes")"
     if [ -z "$asset_id" ]; then
         write_log "Immich: asset not found, tag not applied: $fname" "WARN"
         return 1
@@ -186,10 +275,12 @@ immich_check_uploaded() {
     if ! immich_configured || [ "$GU_IMMICH_CHECK" != "1" ]; then
         return 1
     fi
-    local fname
-    fname="$(basename "$fpath")"
-    [ "$(immich_asset_has_tag "$fpath" "$fname")" = "1" ]
+    immich_asset_has_tag "$fpath" "$(basename "$fpath")"
 }
+
+# ---------------------------------------------------------------------
+# END IMMICH INTEGRATION
+# ---------------------------------------------------------------------
 
 # Terminal Colors
 CYAN='\033[0;36m'
