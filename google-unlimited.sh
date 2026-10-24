@@ -93,7 +93,7 @@ immich_json_get() {
         echo ""
         return 0
     fi
-    printf '%s' "$json" | python3 -c "$filter" 2>/dev/null || true
+    printf '%s' "$json" | python3 -c "$filter" "${@:3}" 2>/dev/null || true
 }
 
 # Search Immich assets by file name and resolve the one matching our copied file.
