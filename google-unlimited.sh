@@ -14,6 +14,14 @@ SERVICE_NAME="google-unlimited.service"
 USER_SYSTEMD_DIR="$HOME/.config/systemd/user"
 OS="${OS:-$(uname -s)}"
 
+# Upload throttle & dry-run configuration (environment-overridable)
+#   GU_DELAY_SECONDS : pause between uploads (0 = no delay). Default 10s ~ 350 files/hour.
+#   GU_DAILY_CAP     : max successful uploads per calendar day (0 = unlimited).
+#   GU_DRY_RUN       : 1 = scan and report what WOULD be uploaded, without uploading.
+GU_DELAY_SECONDS="${GU_DELAY_SECONDS:-10}"
+GU_DAILY_CAP="${GU_DAILY_CAP:-0}"
+GU_DRY_RUN="${GU_DRY_RUN:-0}"
+
 # Terminal Colors
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -1013,6 +1021,24 @@ invoke_upload() {
         return
     fi
 
+    # Dry-run mode: report what would be uploaded, without uploading
+    if [ "$GU_DRY_RUN" = "1" ]; then
+        echo "             [DRYRUN] Would upload"
+        write_log "DRYRUN | would upload: $fname (${size_mb} MB)" "INFO"
+        return
+    fi
+
+    # Daily cap: defer files once the day's upload budget is exhausted;
+    # the 15-minute safety sweep will pick them up again (e.g. next day).
+    if [[ "$GU_DAILY_CAP" =~ ^[0-9]+$ ]] && [ "$GU_DAILY_CAP" -gt 0 ]; then
+        local today_count
+        today_count="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE date(uploaded_at)=date('now','localtime');" 2>/dev/null || echo 0)"
+        if [ "${today_count:-0}" -ge "$GU_DAILY_CAP" ]; then
+            write_log "Daily cap reached ($GU_DAILY_CAP today) - deferring: $fname" "WARN"
+            return
+        fi
+    fi
+
     echo ""
     echo "[$(date '+%H:%M:%S')] Detected  : $fname (${size_mb} MB)"
     echo "             Path      : $fpath"
@@ -1083,27 +1109,36 @@ EOF
             save_retry "$fpath" "$attempts"
         fi
     fi
+
+    # Throttle: pause between uploads (successful or failed) to stay low-profile
+    if [[ "$GU_DELAY_SECONDS" =~ ^[0-9]+$ ]] && [ "$GU_DELAY_SECONDS" -gt 0 ]; then
+        sleep "$GU_DELAY_SECONDS"
+    fi
 }
 
 # shellcheck disable=SC2120
 do_watch() {
     init_db
 
-    # Check credentials
-    local creds_check
-    creds_check="$(run_gotohp creds list 2>&1 || true)"
-    if ! echo "$creds_check" | grep -q "\*"; then
-        # Auto-recovery: If credentials exist but none has '*', activate the first available account
-        local first_acc
-        first_acc="$(echo "$creds_check" | grep -E -o '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | head -n1 || echo "")"
-        if [ -n "$first_acc" ]; then
-            echo -e "${YELLOW}  [Auto-Recovery] Activating Google Photos account: $first_acc${NC}"
-            run_gotohp creds set "$first_acc" >/dev/null 2>&1 || true
-            creds_check="$(run_gotohp creds list 2>&1 || true)"
+    # Check credentials (skipped in dry-run mode)
+    local creds_check="*dryrun*"
+    if [ "$GU_DRY_RUN" = "1" ]; then
+        echo -e "${YELLOW}  DRY-RUN mode: credentials not validated, and no uploads will be performed.${NC}"
+    else
+        creds_check="$(run_gotohp creds list 2>&1 || true)"
+        if ! echo "$creds_check" | grep -q "\*"; then
+            # Auto-recovery: If credentials exist but none has '*', activate the first available account
+            local first_acc
+            first_acc="$(echo "$creds_check" | grep -E -o '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | head -n1 || echo "")"
+            if [ -n "$first_acc" ]; then
+                echo -e "${YELLOW}  [Auto-Recovery] Activating Google Photos account: $first_acc${NC}"
+                run_gotohp creds set "$first_acc" >/dev/null 2>&1 || true
+                creds_check="$(run_gotohp creds list 2>&1 || true)"
+            fi
         fi
     fi
 
-    if ! echo "$creds_check" | grep -q "\*"; then
+    if [ "$GU_DRY_RUN" != "1" ] && ! echo "$creds_check" | grep -q "\*"; then
         echo ""
         echo -e "${RED}==========================================================${NC}"
         echo -e "${YELLOW}  ACTION REQUIRED: No Google Account Logged In!${NC}"
@@ -1213,6 +1248,10 @@ do_watch() {
     done < <(find "${watch_dirs[@]+"${watch_dirs[@]}"}" -type f -print0 2>/dev/null)
 
     # Flush any pending files from retry queue
+    if [ "$GU_DRY_RUN" = "1" ]; then
+        echo -e "${GREEN}[DRY-RUN] Complete - no files were uploaded or modified.${NC}"
+        return 0
+    fi
     flush_retry_queue
 
     if [ "$file_count" -eq 0 ]; then
