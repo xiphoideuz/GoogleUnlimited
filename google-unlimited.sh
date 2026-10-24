@@ -22,6 +22,175 @@ GU_DELAY_SECONDS="${GU_DELAY_SECONDS:-10}"
 GU_DAILY_CAP="${GU_DAILY_CAP:-0}"
 GU_DRY_RUN="${GU_DRY_RUN:-0}"
 
+# Immich API integration (optional, configured via immich.config or environment)
+#   GU_IMMICH_URL     : Immich server base URL, e.g. http://localhost:2283
+#   GU_IMMICH_API_KEY : Immich API key (Immich web UI -> Account Settings -> API Keys)
+#   GU_IMMICH_TAG     : tag name applied to assets that were uploaded to Google Photos
+#   GU_IMMICH_CHECK   : 1 = skip files whose Immich asset already carries the tag
+GU_IMMICH_URL="${GU_IMMICH_URL:-}"
+GU_IMMICH_API_KEY="${GU_IMMICH_API_KEY:-}"
+GU_IMMICH_TAG="${GU_IMMICH_TAG:-gphotos-uploaded}"
+GU_IMMICH_CHECK="${GU_IMMICH_CHECK:-1}"
+
+load_immich_config() {
+    local cfg="$SCRIPT_DIR/immich.config"
+    [ -f "$cfg" ] || return 0
+    chmod 600 "$cfg" 2>/dev/null || true
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in
+            GU_IMMICH_URL)     GU_IMMICH_URL="$(echo "$v" | tr -d '"' | xargs)" ;;
+            GU_IMMICH_API_KEY) GU_IMMICH_API_KEY="$(echo "$v" | tr -d '"' | xargs)" ;;
+            GU_IMMICH_TAG)     GU_IMMICH_TAG="$(echo "$v" | tr -d '"' | xargs)" ;;
+            GU_IMMICH_CHECK)   GU_IMMICH_CHECK="$(echo "$v" | tr -d '"' | xargs)" ;;
+        esac
+    done < "$cfg"
+}
+
+immich_configured() {
+    [ -n "$GU_IMMICH_URL" ] && [ -n "$GU_IMMICH_API_KEY" ]
+}
+
+immich_api() {
+    local method="$1" endpoint="$2" body="${3:-}"
+    local args=(-s --max-time 15 -X "$method"
+        -H "x-api-key: ${GU_IMMICH_API_KEY}"
+        -H "Accept: application/json"
+        "${GU_IMMICH_URL%/}${endpoint}")
+    if [ -n "$body" ]; then
+        args+=(-H "Content-Type: application/json" -d "$body")
+    fi
+    curl "${args[@]}" 2>/dev/null || true
+}
+
+# Extract one field from a JSON asset/tag object stream.
+# Usage: immich_json_get '<raw json>' <python filter, fed via stdin>
+immich_json_get() {
+    local json="$1" filter="$2"
+    if [ -z "$json" ]; then
+        echo ""
+        return 0
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        : # jq handled inline by callers; normalisation via python only
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo ""
+        return 0
+    fi
+    printf '%s' "$json" | python3 -c "$filter" 2>/dev/null || true
+}
+
+immich_find_asset_id() {
+    local fpath="$1" fname="$2"
+    local resp
+    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"originalPath\":\"${fpath//\"/\\\"}\",\"withArchived\":true,\"take\":100}")"
+    immich_json_get "$resp" '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+target = sys.argv[1] if len(sys.argv) > 1 else None
+if target:
+    for a in d.get("assets", []):
+        if a.get("originalPath") == target:
+            print(a.get("id", "")); break
+' "$fpath"
+}
+
+immich_asset_has_tag() {
+    local fpath="$1" fname="$2"
+    local resp
+    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"originalPath\":\"${fpath//\"/\\\"}\",\"withArchived\":true,\"take\":100}")"
+    immich_json_get "$resp" '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+target = sys.argv[1]
+tagname = sys.argv[2] if len(sys.argv) > 2 else ""
+for a in d.get("assets", []):
+    if a.get("originalPath") != target:
+        continue
+    for t in a.get("tags", []) or []:
+        if t.get("name") == tagname:
+            print("1"); sys.exit(0)
+sys.exit(0)
+' "$fpath" "$GU_IMMICH_TAG"
+}
+
+immich_get_or_create_tag_id() {
+    local resp
+    resp="$(immich_api GET /api/tags)"
+    local tag_id
+    tag_id="$(immich_json_get "$resp" '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+tagname = sys.argv[1]
+for t in d or []:
+    if isinstance(t, dict) and t.get("name") == tagname:
+        print(t.get("id", "")); break
+' "$GU_IMMICH_TAG")"
+    if [ -n "$tag_id" ]; then
+        echo "$tag_id"
+        return 0
+    fi
+    resp="$(immich_api POST /api/tags "{\"name\":\"${GU_IMMICH_TAG//\"/\\\"}\"}")"
+    tag_id="$(immich_json_get "$resp" '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+print(d.get("id", "") if isinstance(d, dict) else "")
+')"
+    echo "$tag_id"
+}
+
+immich_mark_uploaded() {
+    local fpath="$1"
+    if ! immich_configured; then
+        return 0
+    fi
+    local fname
+    fname="$(basename "$fpath")"
+
+    if [ "$GU_DRY_RUN" = "1" ]; then
+        echo "             [DRYRUN] Would tag Immich asset: $GU_IMMICH_TAG"
+        write_log "DRYRUN | would tag Immich asset ($fname): $GU_IMMICH_TAG" "INFO"
+        return 0
+    fi
+
+    local asset_id tag_id
+    asset_id="$(immich_find_asset_id "$fpath" "$fname")"
+    if [ -z "$asset_id" ]; then
+        write_log "Immich: asset not found, tag not applied: $fname" "WARN"
+        return 1
+    fi
+    tag_id="$(immich_get_or_create_tag_id)"
+    if [ -z "$tag_id" ]; then
+        write_log "Immich: could not resolve tag '$GU_IMMICH_TAG': $fname" "WARN"
+        return 1
+    fi
+    immich_api PUT "/api/tags/${tag_id}/assets" "{\"assetIds\":[\"${asset_id//\"/\\\"}\"]}" >/dev/null
+    write_log "Immich | tagged as '$GU_IMMICH_TAG': $fname" "OK"
+}
+
+immich_check_uploaded() {
+    local fpath="$1"
+    if ! immich_configured || [ "$GU_IMMICH_CHECK" != "1" ]; then
+        return 1
+    fi
+    local fname
+    fname="$(basename "$fpath")"
+    [ "$(immich_asset_has_tag "$fpath" "$fname")" = "1" ]
+}
+
 # Terminal Colors
 CYAN='\033[0;36m'
 GREEN='\033[0;32m'
@@ -1028,6 +1197,12 @@ invoke_upload() {
         return
     fi
 
+    # Cross-check with Immich: skip files already marked as uploaded to Google Photos
+    if immich_check_uploaded "$fpath"; then
+        write_log "Already uploaded per Immich tag '$GU_IMMICH_TAG' - skipping: $fname" "INFO"
+        return
+    fi
+
     # Daily cap: defer files once the day's upload budget is exhausted;
     # the 15-minute safety sweep will pick them up again (e.g. next day).
     if [[ "$GU_DAILY_CAP" =~ ^[0-9]+$ ]] && [ "$GU_DAILY_CAP" -gt 0 ]; then
@@ -1089,6 +1264,7 @@ EOF
         echo "  [####################] 100% [OK] Uploaded in ${duration}s: $fname (${size_mb} MB)"
         write_log "SUCCESS | $fname (${size_mb} MB in ${duration}s)" "OK"
         save_upload "$fpath" "$mkey" "$fname" "$size_bytes"
+        immich_mark_uploaded "$fpath" || true
     else
         echo "  [--------------------] FAILED in ${duration}s: $fname"
         local err_suffix=""
@@ -1119,6 +1295,7 @@ EOF
 # shellcheck disable=SC2120
 do_watch() {
     init_db
+    load_immich_config
 
     # Check credentials (skipped in dry-run mode)
     local creds_check="*dryrun*"
