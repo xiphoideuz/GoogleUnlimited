@@ -266,7 +266,7 @@ immich_mark_uploaded() {
         write_log "Immich: could not resolve tag '$GU_IMMICH_TAG': $fname" "WARN"
         return 1
     fi
-    immich_api PUT "/api/tags/${tag_id}/assets" "{\"assetIds\":[\"${asset_id//\"/\\\"}\"]}" >/dev/null
+    immich_api PUT "/api/tags/${tag_id}/assets" "{\"ids\":[\"${asset_id//\"/\\\"}\"]}" >/dev/null
     write_log "Immich | tagged as '$GU_IMMICH_TAG': $fname" "OK"
 }
 
