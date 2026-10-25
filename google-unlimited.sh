@@ -1276,6 +1276,7 @@ wait_for_file_ready() {
 
 invoke_upload() {
     local fpath="$1"
+    local force="${2:-0}"
     [ -d "$fpath" ] && return
     # Security: Skip symbolic links to prevent arbitrary file traversal
     [ -L "$fpath" ] && return
@@ -1297,7 +1298,10 @@ invoke_upload() {
     size_mb=$(awk -v b="$size_bytes" 'BEGIN { printf "%.2f", b/1048576 }')
 
     # Dual-boot cross-platform deduplication check
-    if is_uploaded "$fpath" "$fname" "$size_bytes"; then
+    # (scrubber passes force=1: the file is already in the local DB by
+    # definition, but the Immich tag says it was never/lost backup status,
+    # so it must be re-uploaded.)
+    if [ "$force" != "1" ] && is_uploaded "$fpath" "$fname" "$size_bytes"; then
         return
     fi
 
@@ -1733,6 +1737,16 @@ confirm_start_watcher() {
     esac
 }
 
+# List every media file path under the watched folders (same filter as
+# gu_media_total, but prints full paths).
+gu_media_files() {
+    local d
+    while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        find "$d" -type f -iregex '.*\.\(jpg\|jpeg\|png\|heic\|heif\|webp\|gif\|bmp\|tiff\|tif\|svg\|ico\|jfif\|avif\|dng\|raw\|cr2\|cr3\|nef\|arw\|orf\|rw2\|pef\|srw\|raf\|mp4\|mov\|mkv\|avi\|m4v\|3gp\|3g2\|wmv\|webm\|mpg\|mpeg\|mts\|m2ts\|ts\|flv\|vob\)$' -print 2>/dev/null
+    done < <(gu_watch_dirs)
+}
+
 # Count media files present on disk in the watched folders (fast via find + regex).
 gu_media_total() {
     local total=0 d
@@ -1765,6 +1779,15 @@ gu_status_bar() {
     remainder=$((total - backed))
     [ "$remainder" -lt 0 ] && remainder=0
     echo -e "Total Immich photos: ${total} | Backed up: ${backed} | Remainder: ${remainder}"
+    if [[ "$cap" =~ ^[0-9]+$ ]] && [ "$cap" -gt 0 ]; then
+        local today_count cap_rem
+        today_count="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE date(uploaded_at)=date('now','localtime');" 2>/dev/null || echo 0)"
+        cap_rem=$((cap - today_count))
+        [ "$cap_rem" -lt 0 ] && cap_rem=0
+        echo -e "Daily Cap Remaining: ${cap_rem} (uploaded today: ${today_count} of ${cap})"
+    else
+        echo -e "Daily Cap Remaining: unlimited (no cap set)"
+    fi
     if immich_configured; then
         echo -e "Immich tag: '${GU_IMMICH_TAG}'  (tag display enabled in Immich UI)"
     fi
@@ -2042,6 +2065,144 @@ for t in tags:
     return 0
 }
 
+# rclone-style scrubber (panel [6] / `scrub` command):
+# scan every watched media file against the Immich tag, list the ones that do
+# NOT carry the 'gphotos-uploaded' tag, and force re-upload them via the same
+# invoke_upload path as the watcher (throttle + daily cap still respected;
+# only the local-dedup DB check is bypassed, because a missing tag is exactly
+# these files' notable property).
+do_scrub() {
+    init_db
+    load_gu_config
+    load_immich_config
+    echo ""
+    if ! immich_configured; then
+        echo -e "${YELLOW}[SKIP] Immich is not configured - the scrubber needs the 'gphotos-uploaded' tag to compare against.${NC}"
+        return 0
+    fi
+    local tag_id
+    tag_id="$(immich_api GET /api/tags | python3 -c "
+import sys, json
+try:
+    tags = json.load(sys.stdin) or []
+except Exception:
+    print(''); raise SystemExit
+for t in tags:
+    if t.get('name') == '${GU_IMMICH_TAG}':
+        print(t['id']); break
+")"
+    if [ -z "$tag_id" ]; then
+        echo -e "${RED}[ERROR] Tag '${GU_IMMICH_TAG}' does not exist in Immich - refusing to scrub (would re-upload the ENTIRE library).${NC}"
+        return 1
+    fi
+
+    echo -n "Scrubber: building Immich tagged-set (tagIds walk): "
+    local tag_file err_file walk_progress
+    tag_file="$(mktemp /tmp/opencode/immich_scrub_tag.XXXXXX)"
+    err_file="$(mktemp /tmp/opencode/immich_scrub_err.XXXXXX)"
+    immich_walk_paths "\"tagIds\":[\"${tag_id}\"]" 2>"$err_file" | sed '/^$/d' > "$tag_file"
+    while IFS= read -r walk_progress; do
+        echo -n "${walk_progress#NEXT:} "
+    done < "$err_file"
+    echo ""
+    echo "  Tagged set built: $(awk 'NF {c++} END {print c+0}' "$tag_file") asset path(s) carry '${GU_IMMICH_TAG}'."
+
+    echo -n "Scrubbing watched folders against tag set: "
+    local cands_file f found=0 checked=0 mapped
+    cands_file="$(mktemp /tmp/opencode/immich_scrub_cands.XXXXXX)"
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ -f "$f" ] || continue
+        checked=$((checked + 1))
+        mapped="$(immich_map_path "$f")"
+        if [ -n "$mapped" ] && grep -qxF -- "$mapped" "$tag_file" 2>/dev/null; then
+            continue
+        fi
+        # fallback: /library/ relative suffix
+        if [ -n "$mapped" ]; then
+            local rel
+            rel="$(printf '%s' "$mapped" | sed 's|^.*/library/||')"
+            if [ -n "$rel" ] && ! grep -qxF -- "$mapped" "$tag_file" 2>/dev/null; then
+                mapped="$(awk -v r="/library/${rel}" 'index($0, r) > 0 {print $0; exit}' "$tag_file")"
+                [ -n "$mapped" ] && continue    # found & tagged under mapped path
+            fi
+        fi
+        echo "$f" >> "$cands_file"
+        found=$((found + 1))
+    done < <(gu_media_files)
+    echo "checked ${checked}, missing tag: ${found}"
+    rm -f "$tag_file" "$err_file"
+
+    if [ "$found" -eq 0 ]; then
+        echo -e "${GREEN}[OK] Scrub clean - every watched file is tagged '${GU_IMMICH_TAG}'.${NC}"
+        rm -f "$cands_file"
+        return 0
+    fi
+
+    echo -e "${YELLOW}  Files without the '${GU_IMMICH_TAG}' tag (will be force re-uploaded):${NC}"
+    head -n 20 "$cands_file" | while IFS= read -r f; do
+        echo "    - $f"
+    done
+    [ "$found" -gt 20 ] && echo -e "    ... and $((found - 20)) more"
+    echo -e "${YELLOW}  Note: files that were uploaded earlier but lost their tag may appear${NC}"
+    echo -e "${YELLOW}  twice in Google Photos after this (acceptable for a true scrub).${NC}"
+
+    local state
+    state="$(gu_state)"
+    local watcher_restart=0
+    if [[ "$state" == RUNNING* ]]; then
+        echo -e "${YELLOW}A watcher is currently running: ${state}${NC}"
+        echo "  Scrubbing uploads in parallel would double upload pressure."
+        local ans
+        read -rp "Stop the watcher while the scrubber works? [Y/n]: " ans
+        case "$ans" in
+            n|N|no|No) echo "  Continuing with both running (not recommended)." ;;
+            *)
+                if command -v systemctl >/dev/null 2>&1 \
+                   && systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+                    systemctl --user stop "$SERVICE_NAME" || true
+                else
+                    do_stop >/dev/null 2>&1 || true
+                fi
+                watcher_restart=1
+                echo "  Watcher stopped; it can be restarted after the scrub finishes."
+                ;;
+        esac
+    fi
+
+    local ans
+    read -rp "Force re-upload these ${found} file(s) now? [y/N]: " ans
+    case "$ans" in
+        y|Y|yes|Yes) : ;;
+        *) echo "  Scrub cancelled."; rm -f "$cands_file"
+           if [ "$watcher_restart" -eq 1 ]; then panel_restart_watcher; fi
+           return 0 ;;
+    esac
+
+    local done_count=0 db_before db_after
+    db_before="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads;" 2>/dev/null || echo 0)"
+    echo -e "${CYAN}  Scrubbing (respects GU_DELAY_SECONDS=${GU_DELAY_SECONDS}s and GU_DAILY_CAP)...${NC}"
+    while IFS= read -r f; do
+        done_count=$((done_count + 1))
+        echo "  [$done_count/$found] $(basename "$f")"
+        GU_DRY_RUN="${GU_DRY_RUN}" invoke_upload "$f" 1
+    done < "$cands_file"
+    rm -f "$cands_file"
+
+    db_after="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads;" 2>/dev/null || echo 0)"
+    echo -e "${GREEN}[OK] Scrub pass finished: handled ${done_count} file(s).${NC}"
+    echo -e "  Local DB row delta: ${db_before} -> ${db_after}"
+    if [ "$watcher_restart" -eq 1 ]; then
+        local ans2
+        read -rp "Restart the watcher now? [Y/n]: " ans2
+        case "$ans2" in
+            n|N|no|No) echo "  Leaving the watcher stopped (psst: panel [1]->[4] or 'systemctl --user start' to start it)." ;;
+            *) panel_restart_watcher ;;
+        esac
+    fi
+    return 0
+}
+
 do_panel() {
     init_db
     load_gu_config
@@ -2058,19 +2219,21 @@ do_panel() {
         echo "  [3] View activity logs"
         echo "  [4] Throttle tuning (GU_DELAY_SECONDS / GU_DAILY_CAP)"
         echo "  [5] Dry-run scan (list only, no upload)"
-        echo "  [6] Immich tag report & repair"
-        echo "  [7] Systemd service (enable / disable / status)"
+        echo "  [6] Scrubber: re-upload files missing the Immich tag"
+        echo "  [7] Immich tag report & repair"
+        echo "  [8] Systemd service (enable / disable / status)"
         echo "  [0] Exit"
         echo -e "${CYAN}==========================================================${NC}"
-        read -rp "Select an option [0-7]: " choice
+        read -rp "Select an option [0-8]: " choice
         case "$choice" in
             1) panel_watcher_menu ;;
             2) do_dashboard; press_any_key ;;
             3) do_logs; press_any_key ;;
             4) do_tune; press_any_key ;;
             5) panel_dryrun; press_any_key ;;
-            6) do_immich_report; press_any_key ;;
-            7) panel_systemd_menu ;;
+            6) do_scrub; press_any_key ;;
+            7) do_immich_report; press_any_key ;;
+            8) panel_systemd_menu ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
@@ -2123,6 +2286,11 @@ do_dashboard() {
     remainder=$((total - backed))
     [ "$remainder" -lt 0 ] && remainder=0
     echo -e "  Uploaded (DB)    : ${backed} total / ${today} today"
+    if [[ "$GU_DAILY_CAP" =~ ^[0-9]+$ ]] && [ "$GU_DAILY_CAP" -gt 0 ]; then
+        echo -e "  Daily cap        : ${GU_DAILY_CAP} - remaining today: $((GU_DAILY_CAP - today > 0 ? GU_DAILY_CAP - today : 0))"
+    else
+        echo -e "  Daily cap        : not set (unlimited)"
+    fi
     echo -e "  Watched folders  : $(gu_media_total 2>/dev/null) media files total; remainder=${remainder}"
     echo -e "  Retry queue      : ${retries} pending"
     if immich_configured; then
@@ -2175,7 +2343,7 @@ show_menu() {
     echo "  [6] Disable Auto-Start on Boot"
     echo "  [7] Stop Background Watcher"
     echo "  [8] Verify Binary Integrity"
-    echo "  [9] Control Panel (status bar, tuning, dry-run, Immich report)"
+    echo "  [9] Control Panel (status bar, tuning, dry-run, scrubber, Immich report)"
     echo "  [0] Exit"
     echo -e "${CYAN}==========================================================${NC}"
     read -rp "Select an option [0-9, Default: 1]: " choice
@@ -2211,7 +2379,9 @@ show_help() {
     echo "  creds             Manage credentials securely (creds add / creds list)"
     echo "  panel             Open interactive control panel (status bar"
     echo "                      / watcher control / throttle tuning / dry-run"
-    echo "                      / Immich tag report / systemd service)"
+    echo "                      / scrubber / Immich tag report / systemd service)"
+    echo "  scrub             Scrub watched folders: force re-upload every file"
+    echo "                      missing the Immich 'gphotos-uploaded' tag"
     echo "  menu              Open interactive terminal menu"
     echo "  help              Show this help message"
 }
@@ -2253,6 +2423,9 @@ case "$CMD" in
         ;;
     panel|--panel)
         do_panel
+        ;;
+    scrub|--scrub)
+        do_scrub
         ;;
     tune)
         init_db
