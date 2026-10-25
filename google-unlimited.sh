@@ -121,112 +121,129 @@ immich_json_get() {
 #                   -> unique basename match -> filename + file size match.
 # The mapping matters because Immich returns paths as seen INSIDE its container,
 # so watch_dirs paths are translated via GU_IMMICH_PATH_MAP (host:container).
-immich_find_asset_id() {
-    local fpath="$1" fname="$2"
-    local size_bytes="${3:-0}"
-    local mapped_path rel_suffix resp
-    mapped_path="$(immich_map_path "$fpath")"
-    rel_suffix=""
-    if [[ "$mapped_path" == */library/* ]]; then
-        rel_suffix="${mapped_path#*/library/}"
-    fi
-    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"withArchived\":true,\"take\":200}")"
-    if command -v python3 >/dev/null 2>&1; then
+# ---- Asset map: full-library walk as TSV (originalPath -> id -> fileName) ----
+# The search API ignores originalFileName/take filters on Immich v3.x, so a
+# per-upload filename query only ever saw the newest page. Matching must be
+# done against a complete path -> id map built from a paginated walk instead.
+immich_walk_asset_map() {
+    local extra="${1:-}"
+    local page=1 walk_n=0
+    while :; do
+        walk_n=$((walk_n + 1))
+        [ "$walk_n" -gt 400 ] && break   # safety cap: 400 pages ~ 100k assets
+        local resp next_page
+        if [ -n "$extra" ]; then
+            resp="$(immich_api POST /api/search/metadata "{\"page\":${page},${extra}}")"
+        else
+            resp="$(immich_api POST /api/search/metadata "{\"page\":${page},\"withArchived\":true}")"
+        fi
+        [ -z "$resp" ] && break
         printf '%s' "$resp" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
-assets = d.get("assets") or {}
-if isinstance(assets, dict):
-    assets = assets.get("items", [])
-assets = [a for a in (assets or []) if a.get("originalPath")]
-
-def get_size(a):
-    try:
-        return int(((a.get("exifInfo") or {}).get("fileSizeInByte")) or 0)
-    except (TypeError, ValueError):
-        return 0
-
-target = (sys.argv + [""])[1]
-rel = (sys.argv + ["", ""])[2]
-name = (sys.argv + ["", "", ""])[3]
-size = (sys.argv + ["", "", "", "0"])[4]
-
-if target:
-    for a in assets:
-        if a.get("originalPath") == target:
-            print(a["id"]); sys.exit(0)
-if rel:
-    for a in assets:
-        p = a.get("originalPath", "")
-        if "/library/" in p and p.split("/library/", 1)[1] == rel:
-            print(a["id"]); sys.exit(0)
-by_name = [a for a in assets if a.get("originalFileName") == name]
-if len(by_name) == 1:
-    print(by_name[0]["id"]); sys.exit(0)
+    sys.exit(1)
+a = (d.get("assets") or {})
+for i in (a.get("items") or []):
+    print("\t".join([
+        (i.get("originalPath") or "").replace("\t", " "),
+        i.get("id") or "",
+        (i.get("originalFileName") or "").replace("\t", " "),
+    ]))
+print("NEXT:" + str(a.get("nextPage") or ""), file=sys.stderr)
+' || return 1
+        next_page="$(printf '%s' "$resp" | python3 -c '
+import sys, json
 try:
-    size = int(size)
-except ValueError:
-    size = 0
-if size:
-    by_size = [a for a in by_name if get_size(a) == size]
-    if len(by_size) == 1:
-        print(by_size[0]["id"])
-' "$mapped_path" "$rel_suffix" "$fname" "$size_bytes"
-    elif command -v jq >/dev/null 2>&1; then
-        printf '%s' "$resp" | jq -r --arg t "$mapped_path" '
-            ([(.assets.items // .assets // [])[] | select(.originalPath == $t)][0].id)
-            // ([(.assets.items // .assets // [])[] | select(.originalPath is not null)] | length) as $n
-            | empty
-        ' 2>/dev/null | head -1
-        # jq fallback above handles only the common exact-path case
-    fi
+    d = json.load(sys.stdin)
+except Exception:
+    print(""); raise SystemExit
+print(str((d.get("assets") or {}).get("nextPage") or ""))
+')"
+        [ -z "$next_page" ] && break
+        page="$next_page"
+    done
 }
 
-immich_asset_has_tag() {
-    local fpath="$1" fname="$2"
-    local mapped_path rel_suffix resp
-    mapped_path="$(immich_map_path "$fpath")"
-    rel_suffix=""
-    if [[ "$mapped_path" == */library/* ]]; then
-        rel_suffix="${mapped_path#*/library/}"
+# Cached library map (file is refreshed when older than GU_IMMICH_MAP_TTL
+# seconds, default 300). Prints the cache file path, or NONE on failure.
+immich_asset_map_cache() {
+    local cache="$SCRIPT_DIR/.immich_asset_map.tsv"
+    local ttl="${GU_IMMICH_MAP_TTL:-300}"
+    if [ -f "$cache" ]; then
+        local age
+        age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+        [ "${age:-999999}" -lt "$ttl" ] && { echo "$cache"; return 0; }
     fi
-    resp="$(immich_api POST /api/search/metadata "{\"originalFileName\":\"${fname//\"/\\\"}\",\"withArchived\":true,\"take\":200}")"
-    local result=1
-    if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$resp" | python3 -c '
-import sys, json
+    local tmp="$cache.tmp.$$"
+    if ! immich_walk_asset_map "" 2>/dev/null > "$tmp" || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        echo "NONE"
+        return 1
+    fi
+    mv "$tmp" "$cache"
+    chmod 600 "$cache" 2>/dev/null || true
+    echo "$cache"
+}
+
+# Find an asset id for a local file by matching the cached full-library map:
+#   1. exact originalPath match (after host->container path mapping)
+#   2. unique /library/ relative-suffix match
+#   3. unique originalFileName match (last resort; skipped when ambiguous)
+immich_find_asset_id() {
+    local fpath="$1" fname="${2:-$(basename "$fpath")}"
+    local size_bytes="${3:-0}"
+    local map mapped rel id candidates n_candidates
+    map="$(immich_asset_map_cache)"
+    [ "$map" = "NONE" ] && return 1
+    mapped="$(immich_map_path "$fpath")"
+
+    # 1) exact container path
+    id="$(awk -F'\t' -v p="$mapped" '$1 == p {print $2; exit}' "$map")"
+    [ -n "$id" ] && { echo "$id"; return 0; }
+
+    # 2) unique /library/ relative suffix
+    if [[ "$mapped" == */library/* ]]; then
+        rel="/library/${mapped#*/library/}"
+        candidates="$(awk -F'\t' -v r="$rel" 'index($1, r) > 0 {print $2}' "$map")"
+        n_candidates="$(printf '%s' "$candidates" | grep -c .)"
+        if [ "$n_candidates" = "1" ]; then
+            echo "$candidates"
+            return 0
+        fi
+    fi
+
+    # 3) unique originalFileName
+    candidates="$(awk -F'\t' -v n="$fname" '$3 == n {print $2}' "$map")"
+    n_candidates="$(printf '%s' "$candidates" | grep -c .)"
+    if [ "$n_candidates" = "1" ]; then
+        echo "$candidates"
+        return 0
+    fi
+
+    return 1
+}
+
+# Tag check via the per-asset detail endpoint: search/metadata never
+# populates tags on Immich v3.x, so we resolve the asset id through the
+# cached library map and ask for that single asset's real tag list.
+immich_asset_has_tag() {
+    local fpath="$1" fname="${2:-$(basename "$fpath")}"
+    local asset_id resp result=1
+    asset_id="$(immich_find_asset_id "$fpath" "$fname")"
+    [ -z "$asset_id" ] && return 1
+    resp="$(immich_api GET "/api/assets/${asset_id}")"
+    printf '%s' "$resp" | GU_IMMICH_TAG="$GU_IMMICH_TAG" python3 -c '
+import sys, json, os
 try:
     d = json.load(sys.stdin)
 except Exception:
-    sys.exit(0)
-assets = d.get("assets") or {}
-if isinstance(assets, dict):
-    assets = assets.get("items", [])
-target = (sys.argv + [""])[1]
-rel = (sys.argv + ["", ""])[2]
-tagname = (sys.argv + ["", "", ""])[3]
-def wanted(a):
-    p = a.get("originalPath", "")
-    if target and p == target:
-        return True
-    if rel and "/library/" in p and p.split("/library/", 1)[1] == rel:
-        return True
-    return False
-for a in (assets or []):
-    if wanted(a):
-        for t in a.get("tags", []) or []:
-            if t.get("name") == tagname:
-                print("1"); sys.exit(0)
-' "$mapped_path" "$rel_suffix" "$GU_IMMICH_TAG" | grep -q "^1$" && result=0
-    elif command -v jq >/dev/null 2>&1; then
-        printf '%s' "$resp" | jq -r --arg t "$mapped_path" --arg g "$GU_IMMICH_TAG" '
-            ([(.assets.items // .assets // [])[] | select(.originalPath == $t)] | .[0].tags // []) 
-            | map(select(.name == $g)) | length > 0
-        ' 2>/dev/null | grep -q true && result=0
-    fi
+    raise SystemExit(1)
+tagname = os.environ.get("GU_IMMICH_TAG", "")
+tags = [t.get("name", "") for t in (d.get("tags") or [])]
+sys.exit(0 if tagname in tags else 1)
+' && result=0
     return $result
 }
 immich_get_or_create_tag_id() {
@@ -261,12 +278,18 @@ print(d.get("id", "") if isinstance(d, dict) else "")
 }
 
 # ---- Retag queue: remember files whose Immich tag failed, retry later ----
+# gu_sqlite: sqlite3 with a busy timeout so queue updates don't fail when the
+# running watcher holds the DB briefly.
+gu_sqlite() {
+    sqlite3 -cmd '.timeout 5000' "$DB" "$@" 2>/dev/null || true
+}
+
 save_retag() {
     local fpath="$1" reason="${2:-tag failed}"
     local esc esc_reason
     esc="$(escape_sqlite_literal "$fpath")"
     esc_reason="$(escape_sqlite_literal "$reason")"
-    sqlite3 "$DB" <<EOF 2>/dev/null || true
+    gu_sqlite <<EOF
 INSERT INTO retag_queue(path, last_reason) VALUES ('$esc', '$esc_reason')
 ON CONFLICT(path) DO UPDATE SET last_reason = excluded.last_reason;
 EOF
@@ -275,14 +298,16 @@ EOF
 remove_retag() {
     local esc
     esc="$(escape_sqlite_literal "$1")"
-    sqlite3 "$DB" "DELETE FROM retag_queue WHERE path = '$esc';" 2>/dev/null || true
+    gu_sqlite "DELETE FROM retag_queue WHERE path = '$esc';"
 }
 
 retag_pending_count() {
-    sqlite3 "$DB" "SELECT COUNT(*) FROM retag_queue;" 2>/dev/null || echo 0
+    sqlite3 -cmd '.timeout 5000' "$DB" "SELECT COUNT(*) FROM retag_queue;" 2>/dev/null || echo 0
 }
 
-# One retag attempt; on success the row leaves the queue.
+# One retag attempt; on success the row leaves the queue. After
+# GU_GHOST_ATTEMPTS (default 5) consecutive failures the entry is parked
+# on the ghost list for manual inspection instead of being retried forever.
 retag_attempt() {
     local p="$1" esc
     esc="$(escape_sqlite_literal "$p")"
@@ -290,14 +315,40 @@ retag_attempt() {
         remove_retag "$p"
         return 0
     fi
-    sqlite3 "$DB" "UPDATE retag_queue SET attempts = attempts + 1, last_attempt = datetime('now','localtime') WHERE path = '$esc';" 2>/dev/null || true
+    local now_attempts ghost_cap
+    ghost_cap="${GU_GHOST_ATTEMPTS:-5}"
+    now_attempts="$(gu_sqlite "UPDATE retag_queue SET attempts = attempts + 1, last_attempt = datetime('now','localtime') WHERE path = '$esc'; SELECT attempts FROM retag_queue WHERE path = '$esc';")"
+    if [ "${now_attempts:-0}" -ge "$ghost_cap" ]; then
+        gu_sqlite <<EOF
+INSERT OR REPLACE INTO retag_ghosts(path, attempts, last_attempt, last_reason, ghosted_at)
+SELECT path, attempts, last_attempt, last_reason, datetime('now','localtime') FROM retag_queue WHERE path = '$esc';
+DELETE FROM retag_queue WHERE path = '$esc';
+EOF
+        write_log "GHOST: $(basename "$p") parked after ${now_attempts} failed retag attempts - needs manual check" "WARN"
+        return 1
+    fi
     return 1
+}
+
+ghost_count() {
+    gu_sqlite "SELECT COUNT(*) FROM retag_ghosts;" || echo 0
+}
+
+# Move all ghosts back into the live retag queue (attempts reset) so the
+# improved finder gets another shot at them.
+requeue_ghosts() {
+    gu_sqlite <<EOF
+INSERT OR REPLACE INTO retag_queue(path, attempts, queued_at, last_reason)
+SELECT path, 0, datetime('now','localtime'), COALESCE(last_reason,'') || ' | ghost re-check'
+FROM retag_ghosts;
+DELETE FROM retag_ghosts;
+EOF
 }
 
 # Retry up to N queued retags (oldest/fewest attempts first).
 drain_retag() {
     local limit="${1:-10}" ok=0 paths p
-    paths="$(sqlite3 "$DB" "SELECT path FROM retag_queue ORDER BY attempts ASC, queued_at ASC LIMIT ${limit};" 2>/dev/null || true)"
+    paths="$(gu_sqlite "SELECT path FROM retag_queue ORDER BY attempts ASC, queued_at ASC LIMIT ${limit};")"
     [ -z "$paths" ] && return 0
     while IFS= read -r p; do
         [ -z "$p" ] && continue
@@ -320,30 +371,74 @@ do_retag() {
     fi
     local pending rows
     pending="$(retag_pending_count)"
-    if [ "${pending:-0}" -eq 0 ]; then
+    if [ "${pending:-0}" -gt 0 ]; then
+        echo -e "${CYAN}  Retag queue: ${pending} file(s) whose tag attempt(s) failed${NC}"
+        echo "    path | attempts | last attempt | reason"
+        rows="$(gu_sqlite "SELECT path || ' | ' || attempts || ' | ' || COALESCE(last_attempt,'-') || ' | ' || COALESCE(last_reason,'-') FROM retag_queue ORDER BY attempts ASC, queued_at ASC;")"
+        while IFS= read -r rows_line; do
+            [ -z "$rows_line" ] && continue
+            echo "    $rows_line"
+        done <<< "$rows"
+        local ans
+        read -rp "Retry tagging these ${pending} file(s) now? [y/N]: " ans
+        case "$ans" in
+            y|Y|yes|Yes)
+                local ok
+                ok="$(drain_retag "$pending")"
+                ok="${ok//[^0-9]/}"
+                ok="${ok:-0}"
+                echo -e "${GREEN}[OK] Retag pass finished: ${ok} succeeded, $((pending - ok)) still queued.${NC}"
+                ;;
+            *) echo "  Skipped." ;;
+        esac
+    else
         echo -e "${GREEN}[OK] Retag queue empty - every uploaded file has a successful tag attempt.${NC}"
-        return 0
     fi
-    echo -e "${CYAN}  Retag queue: ${pending} file(s) whose tag attempt(s) failed${NC}"
-    echo "    path | attempts | last attempt | reason"
-    rows="$(sqlite3 "$DB" "SELECT path || ' | ' || attempts || ' | ' || COALESCE(last_attempt,'-') || ' | ' || COALESCE(last_reason,'-') FROM retag_queue ORDER BY attempts ASC, queued_at ASC;" 2>/dev/null || true)"
-    while IFS= read -r rows_line; do
-        [ -z "$rows_line" ] && continue
-        echo "    $rows_line"
-    done <<< "$rows"
-    local ans
-    read -rp "Retry tagging these ${pending} file(s) now? [y/N]: " ans
-    case "$ans" in
-        y|Y|yes|Yes)
-            local ok
-            ok="$(drain_retag "$pending")"
-            ok="${ok//[^0-9]/}"
-            ok="${ok:-0}"
-            echo -e "${GREEN}[OK] Retag pass finished: ${ok} succeeded, $((pending - ok)) still queued.${NC}"
-            ;;
-        *) echo "  Skipped." ;;
-    esac
+
+    # Ghost list: entries parked after GU_GHOST_ATTEMPTS failed rounds.
+    local ghosts g_cap
+    g_cap="${GU_GHOST_ATTEMPTS:-5}"
+    ghosts="$(ghost_count)"
+    if [ "${ghosts:-0}" -gt 0 ]; then
+        echo ""
+        echo -e "${YELLOW}  Ghost list: ${ghosts} file(s) parked after ${g_cap} failed rounds - verify these by hand in the Immich web UI.${NC}"
+        echo "    path | attempts | last attempt | reason"
+        rows="$(gu_sqlite "SELECT path || ' | ' || attempts || ' | ' || COALESCE(last_attempt,'-') || ' | ' || COALESCE(last_reason,'-') FROM retag_ghosts ORDER BY ghosted_at ASC LIMIT 10;")"
+        while IFS= read -r rows_line; do
+            [ -z "$rows_line" ] && continue
+            echo "    $rows_line"
+        done <<< "$rows"
+        echo -e "    (if more than 10, use:  sqlite3 gphotos.db \"SELECT * FROM retag_ghosts;\")"
+        local ans2
+        read -rp "Re-check the ghost(s) with a fresh library map and re-queue them? [y/N]: " ans2
+        case "$ans2" in
+            y|Y|yes|Yes)
+                # force a fresh map so the re-check sees the newest library state
+                rm -f "$SCRIPT_DIR/.immich_asset_map.tsv" 2>/dev/null || true
+                requeue_ghosts
+                local g_pending g_ok
+                g_pending="$(retag_pending_count)"
+                g_ok="$(drain_retag "$g_pending")"
+                g_ok="${g_ok//[^0-9]/}"
+                g_ok="${g_ok:-0}"
+                echo -e "${GREEN}[OK] Ghost re-check: ${g_ok} recovered, $((g_pending - g_ok)) returned to the ghost list (or remain queued).${NC}"
+                display_ghost_note
+                ;;
+            *) echo "  Ghosts left for manual check." ;;
+        esac
+    fi
     return 0
+}
+
+display_ghost_note() {
+    local ghosts
+    ghosts="$(ghost_count)"
+    if [ "${ghosts:-0}" -gt 0 ]; then
+        echo -e "${YELLOW}  ${ghosts} ghost(s) parked: uploaded to Google Photos, but no matching asset exists in Immich.${NC}"
+        echo "  Likely causes: copied into the storage folder outside Immich, removed"
+        echo "  from Immich while the file stayed on disk, or a lookup gap."
+        echo "  Check the name in Immich's web UI; nothing is re-uploaded for ghosts."
+    fi
 }
 
 immich_mark_uploaded() {
@@ -676,6 +771,13 @@ CREATE TABLE IF NOT EXISTS retag_queue (
     queued_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
     last_attempt TEXT,
     last_reason  TEXT
+);
+CREATE TABLE IF NOT EXISTS retag_ghosts (
+    path         TEXT PRIMARY KEY,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_attempt TEXT,
+    last_reason  TEXT,
+    ghosted_at   TEXT NOT NULL DEFAULT (datetime('now','localtime'))
 );
 EOF
 
@@ -2449,7 +2551,7 @@ do_dashboard() {
     fi
     echo -e "  Watched folders  : $(gu_media_total 2>/dev/null) media files total; remainder=${remainder}"
     echo -e "  Retry queue      : ${retries} pending"
-    echo -e "  Retag queue      : $(retag_pending_count) pending (Immich tag retries)"
+    echo -e "  Retag queue      : $(retag_pending_count) pending, $(ghost_count) ghost(s) - see panel [7]"
     if immich_configured; then
         echo -e "  Immich           : configured (${GU_IMMICH_URL}), tag '${GU_IMMICH_TAG}'"
     else
