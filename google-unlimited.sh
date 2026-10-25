@@ -1713,6 +1713,26 @@ gu_state() {
     echo "$state"
 }
 
+# Gatekeeper for manual starts: confirm starting a second instance when a
+# watcher already runs. Duplicate watchers bypass the throttle pacing between
+# them, so users should see a warning and explicitly opt in.
+confirm_start_watcher() {
+    local state
+    state="$(gu_state)"
+    case "$state" in
+        RUNNING*)
+            echo -e "${YELLOW}A watcher is currently running: ${state}${NC}"
+            echo -e "  (Tip: to watch uploads live, panel [3] View activity logs tails the same DB.)"
+            local ans
+            read -rp "Proceed to start a new watcher? [y/N]: " ans
+            case "$ans" in
+                y|Y|yes|Yes) return 0 ;;
+                *) echo "  Cancelled." ; return 1 ;;
+            esac ;;
+        *) return 0 ;;
+    esac
+}
+
 # Count media files present on disk in the watched folders (fast via find + regex).
 gu_media_total() {
     local total=0 d
@@ -1857,6 +1877,50 @@ panel_dryrun() {
 # (page size fixed at 250 by Immich; page param honored, take/pageSize ignored),
 # building a path->tags map, then classifies every local upload:
 #   tagged / untagged / not found in Immich.
+# Walk every page of a search/metadata query, printing asset originalPath values.
+# Immich v3.x honors "page" (fixed page size 250) but ignores take/pageSize and
+# never populates the items' tags array, so tag membership must be resolved via
+# a tagIds-filtered walk instead of per-item tags.
+# Usage: immich_walk_paths '"tagIds":["..."]' >paths.txt      (tag filter walk)
+#        immich_walk_paths ''                                 (whole library walk)
+immich_walk_paths() {
+    local extra="$1"
+    local page=1 walk_n=0
+    while :; do
+        walk_n=$((walk_n + 1))
+        [ "$walk_n" -gt 400 ] && break   # safety cap: 400 pages ~ 100k assets
+        local resp next_page
+        if [ -n "$extra" ]; then
+            resp="$(immich_api POST /api/search/metadata "{\"page\":${page},${extra}}")"
+        else
+            resp="$(immich_api POST /api/search/metadata "{\"page\":${page},\"withArchived\":true}")"
+        fi
+        [ -z "$resp" ] && break
+        printf '%s' "$resp" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+a = (d.get("assets") or {})
+for i in (a.get("items") or []):
+    print((i.get("originalPath") or "").replace("\t", " "))
+print("NEXTPAGE:" + str(a.get("nextPage") or ""))
+' || return 1
+        next_page="$(printf '%s' "$resp" | python3 -c '
+import sys, json
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    print(""); raise SystemExit
+print(str((d.get("assets") or {}).get("nextPage") or ""))
+')"
+        [ -z "$next_page" ] && break
+        page="$next_page"
+        echo "NEXT:$page" >&2
+    done
+}
+
 do_immich_report() {
     init_db
     load_immich_config
@@ -1866,71 +1930,86 @@ do_immich_report() {
         return 0
     fi
 
-    local map_file
+    local map_file tag_file err_file walk_progress
     map_file="$(mktemp /tmp/opencode/immich_map.XXXXXX)"
-    local page=1 max_pages=0 last_processed=""
-    echo -n "Loading Immich library pages: "
-    while :; do
-        max_pages=$((max_pages + 1))
-        [ "$max_pages" -gt 400 ] && break   # safety cap: 400 pages ~ 100k assets
-        local resp next_page
-        resp="$(immich_api POST /api/search/metadata "{\"page\":${page},\"withArchived\":true}")"
-        [ -z "$resp" ] && break
-        next_page=""
-        printf '%s' "$resp" | python3 -c '
-import sys, json, io
+    tag_file="$(mktemp /tmp/opencode/immich_tagged.XXXXXX)"
+    err_file="$(mktemp /tmp/opencode/immich_err.XXXXXX)"
+
+    echo -n "Walking Immich library pages: "
+    local tag_id
+    tag_id="$(immich_api GET /api/tags | python3 -c "
+import sys, json
 try:
-    d = json.load(sys.stdin)
+    tags = json.load(sys.stdin) or []
 except Exception:
-    sys.exit(0)
-assets = (d.get("assets") or {})
-items = assets.get("items") or []
-for a in items:
-    p = a.get("originalPath") or ""
-    tags = ",".join(t.get("name", "") for t in (a.get("tags") or []))
-    print(p.replace("\t", " ") + "\t" + tags)
-print("NEXTPAGE:" + str(assets.get("nextPage") or ""))
-' >> "$map_file" || break
-        next_page="$(grep -q 'NEXTPAGE:' "$map_file" && true)"
-        next_page="$(sed -n 's/^NEXTPAGE://p' "$map_file" | tail -1)"
-        sed -i 's/^NEXTPAGE:.*$//' "$map_file"
-        [ -z "$next_page" ] && break
-        page=$(($next_page))
-        echo -n "${page} "
-    done
+    print(''); raise SystemExit
+for t in tags:
+    if t.get('name') == '${GU_IMMICH_TAG}':
+        print(t['id']); break
+")"
+    immich_walk_paths '' 2>"$err_file" | sed '/^$/d' > "$map_file"
+    while IFS= read -r walk_progress; do
+        echo -n "${walk_progress#NEXT:} "
+    done < "$err_file"
     echo ""
-    local lib_count
-    lib_count="$(grep -ct . "$map_file" 2>/dev/null || echo 0)"
-    echo -e "Immich library scanned: ${lib_count} asset path(s) over $((page - 1)) page(s)."
+    if ! [ -s "$map_file" ]; then
+        echo -e "${YELLOW}[WARN] Immich walk returned 0 assets (API error?).${NC}"
+        rm -f "$map_file" "$tag_file" "$err_file"
+        return 0
+    fi
+
+    echo -n "Walking tagged assets (tagIds): "
+    if [ -n "$tag_id" ]; then
+        immich_walk_paths "\"tagIds\":[\"${tag_id}\"]" 2>>"$err_file" | sed '/^$/d' > "$tag_file"
+        while IFS= read -r walk_progress; do
+            echo -n "${walk_progress#NEXT:} "
+        done < "$err_file"
+        echo -n ""
+    else
+        echo -n "tag '${GU_IMMICH_TAG}' not found "
+    fi
+    echo ""
+    rm -f "$err_file"
+
+    local lib_count tagged_count
+    lib_count="$(awk 'NF {c++} END {print c+0}' "$map_file")"
+    tagged_count="$(awk 'NF {c++} END {print c+0}' "$tag_file")"
+    echo -e "Immich library scan: ${lib_count} asset path(s); of those, tagged as '${GU_IMMICH_TAG}': ${GREEN}${tagged_count}${NC}"
 
     local total=0 tagged=0 gap_un=0 gap_nf=0
     local -a gaps=()
-    local f mapped tagline rel
+    local f mapped rel
     while IFS= read -r f; do
         [ -z "$f" ] && continue
         [ -f "$f" ] || continue
         total=$((total + 1))
         mapped="$(immich_map_path "$f")"
-        tagline="$(awk -F'\t' -v p="$mapped" '$1 == p {print $2; exit}' "$map_file")"
-        if [ -z "$tagline" ]; then
+        if [ -n "$mapped" ] && grep -qxF -- "$mapped" "$tag_file" 2>/dev/null; then
+            tagged=$((tagged + 1))
+            continue
+        fi
+        if [ -z "$mapped" ] || ! grep -qxF -- "$mapped" "$map_file" 2>/dev/null; then
             # fallback: match on the /library/ relative suffix
             rel="$(printf '%s' "$mapped" | sed 's|^.*/library/||')"
-            if [ -n "$rel" ]; then
-                mapped="$(awk -F'\t' -v r="/library/${rel}" 'index($1, r) > 0 {print $1; exit}' "$map_file")"
-                [ -n "$mapped" ] && tagline="$(awk -F'\t' -v p="$mapped" '$1 == p {print $2; exit}' "$map_file")"
+            if [ -n "$rel" ] && [ -n "$mapped" ]; then
+                mapped="$(awk -v r="/library/${rel}" 'index($0, r) > 0 {print $0; exit}' "$map_file")"
+            else
+                mapped=""
+            fi
+            if [ -z "$mapped" ]; then
+                gaps+=("NOT-IN-IMMICH | $f")
+                gap_nf=$((gap_nf + 1))
+                continue
             fi
         fi
-        if [ -z "$mapped" ]; then
-            gaps+=("NOT-IN-IMMICH | $f")
-            gap_nf=$((gap_nf + 1))
-        elif [[ ",${tagline:-}," != *",${GU_IMMICH_TAG},"* ]]; then
+        if grep -qxF -- "$mapped" "$tag_file" 2>/dev/null; then
+            tagged=$((tagged + 1))
+        else
             gaps+=("UNTAGGED     | $f")
             gap_un=$((gap_un + 1))
-        else
-            tagged=$((tagged + 1))
         fi
     done < <(sqlite3 "$DB" "SELECT path FROM uploads;" 2>/dev/null)
-    rm -f "$map_file"
+    rm -f "$map_file" "$tag_file"
 
     echo -e "Uploaded (local DB): ${total}   Tagged: ${GREEN}${tagged}${NC}   Untagged: ${gap_un}   Not in Immich: ${gap_nf}"
     if [ ${#gaps[@]} -gt 0 ]; then
@@ -1939,16 +2018,20 @@ print("NEXTPAGE:" + str(assets.get("nextPage") or ""))
         for i in "${gaps[@]}"; do
             echo "    - $i"
         done
-        local ans
+        local ans seen_file
         read -rp "Attempt to tag the untagged/missed file(s) now? [y/N]: " ans
         case "$ans" in
             y|Y|yes|Yes)
+                seen_file="$(mktemp /tmp/opencode/immich_seen.XXXXXX)"
                 for i in "${gaps[@]}"; do
                     [[ "$i" == NOT-IN-IMMICH* ]] && continue
                     local pth
                     pth="${i#*| }"
+                    grep -qxF -- "$pth" "$seen_file" 2>/dev/null && continue
+                    echo "$pth" >> "$seen_file"
                     immich_mark_uploaded "$pth" || true
                 done
+                rm -f "$seen_file"
                 echo -e "${GREEN}[OK] Repair pass finished.${NC}"
                 ;;
             *) echo "  Skipped repair." ;;
@@ -1982,7 +2065,7 @@ do_panel() {
         read -rp "Select an option [0-7]: " choice
         case "$choice" in
             1) panel_watcher_menu ;;
-            2) do_dashboard ;;
+            2) do_dashboard; press_any_key ;;
             3) do_logs; press_any_key ;;
             4) do_tune; press_any_key ;;
             5) panel_dryrun; press_any_key ;;
@@ -1996,7 +2079,12 @@ do_panel() {
 
 press_any_key() {
     echo ""
-    read -rp "Press Enter to return to the panel..." _
+    local k
+    read -rp "Press [0/Enter] to go back to the menu, [q] to quit: " k
+    case "$k" in
+        q|Q) exit 0 ;;
+        *) : ;;
+    esac
 }
 
 panel_watcher_menu() {
@@ -2007,14 +2095,17 @@ panel_watcher_menu() {
     echo "  [3] Stop background watcher"
     echo "  [4] Restart background watcher"
     echo "  [0] Back"
+    echo "  [q] Quit"
     local ch
-    read -rp "Select [0-4]: " ch
+    read -rp "Select [0-4, q]: " ch
     case "$ch" in
-        1) do_watch ;;
-        2) (cd "$SCRIPT_DIR" && setsid nohup ./google-unlimited.sh watch >/dev/null 2>&1 &)
-           echo -e "${GREEN}[OK] Background watcher started.${NC}" ;;
+        1) confirm_start_watcher && do_watch ;;
+        2) confirm_start_watcher && \
+           (cd "$SCRIPT_DIR" && setsid nohup ./google-unlimited.sh watch >/dev/null 2>&1 &) \
+           && echo -e "${GREEN}[OK] Background watcher started.${NC}" ;;
         3) do_stop ;;
         4) panel_restart_watcher ;;
+        q|Q) exit 0 ;;
         *) : ;;
     esac
 }
@@ -2040,7 +2131,7 @@ do_dashboard() {
         echo -e "  Immich           : not configured (tag features off)"
     fi
     if command -v systemctl >/dev/null 2>&1; then
-        echo -e "  Systemd service  : $(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null || echo inactive)"
+        echo -e "  Systemd service  : $(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null)"
     fi
 }
 
@@ -2050,12 +2141,14 @@ panel_systemd_menu() {
     echo "  [2] Disable auto-start on boot"
     echo "  [3] Service status"
     echo "  [0] Back"
+    echo "  [q] Quit"
     local ch
-    read -rp "Select [0-3]: " ch
+    read -rp "Select [0-3, q]: " ch
     case "$ch" in
         1) do_enable_startup ;;
         2) do_disable_startup ;;
         3) if command -v systemctl >/dev/null 2>&1; then systemctl --user status "$SERVICE_NAME" --no-pager 2>/dev/null || echo -e "${YELLOW}Service not found.${NC}"; fi ;;
+        q|Q) exit 0 ;;
         *) : ;;
     esac
 }
@@ -2068,6 +2161,8 @@ show_menu() {
     echo -e "${CYAN}==========================================================${NC}"
     echo -e "${GREEN}  *  GoogleUnlimited - Unix Manager ($OS)${NC}"
     echo -e "${CYAN}==========================================================${NC}"
+    # Live status bar on the first page, same as the control panel page.
+    { init_db 2>/dev/null; load_gu_config 2>/dev/null; load_immich_config 2>/dev/null; gu_status_bar; } || true
     echo "  [1] Start Live Watcher (Foreground)"
     echo "  [2] Check Backup Status"
     echo "  [3] View Activity Logs"
@@ -2087,14 +2182,14 @@ show_menu() {
     choice="${choice:-1}"
 
     case "$choice" in
-        1) do_watch ;;
-        2) do_status ;;
-        3) do_logs ;;
+        1) confirm_start_watcher && do_watch ;;
+        2) do_status; press_any_key ;;
+        3) do_logs; press_any_key ;;
         4) do_setup ;;
         5) do_enable_startup ;;
         6) do_disable_startup ;;
         7) do_stop ;;
-        8) do_verify ;;
+        8) do_verify; press_any_key ;;
         9) do_panel ;;
         0) exit 0 ;;
         *) echo "Invalid option"; sleep 1; show_menu ;;
