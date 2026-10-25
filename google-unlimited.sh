@@ -260,6 +260,92 @@ print(d.get("id", "") if isinstance(d, dict) else "")
     echo "$tag_id"
 }
 
+# ---- Retag queue: remember files whose Immich tag failed, retry later ----
+save_retag() {
+    local fpath="$1" reason="${2:-tag failed}"
+    local esc esc_reason
+    esc="$(escape_sqlite_literal "$fpath")"
+    esc_reason="$(escape_sqlite_literal "$reason")"
+    sqlite3 "$DB" <<EOF 2>/dev/null || true
+INSERT INTO retag_queue(path, last_reason) VALUES ('$esc', '$esc_reason')
+ON CONFLICT(path) DO UPDATE SET last_reason = excluded.last_reason;
+EOF
+}
+
+remove_retag() {
+    local esc
+    esc="$(escape_sqlite_literal "$1")"
+    sqlite3 "$DB" "DELETE FROM retag_queue WHERE path = '$esc';" 2>/dev/null || true
+}
+
+retag_pending_count() {
+    sqlite3 "$DB" "SELECT COUNT(*) FROM retag_queue;" 2>/dev/null || echo 0
+}
+
+# One retag attempt; on success the row leaves the queue.
+retag_attempt() {
+    local p="$1" esc
+    esc="$(escape_sqlite_literal "$p")"
+    if immich_mark_uploaded "$p"; then
+        remove_retag "$p"
+        return 0
+    fi
+    sqlite3 "$DB" "UPDATE retag_queue SET attempts = attempts + 1, last_attempt = datetime('now','localtime') WHERE path = '$esc';" 2>/dev/null || true
+    return 1
+}
+
+# Retry up to N queued retags (oldest/fewest attempts first).
+drain_retag() {
+    local limit="${1:-10}" ok=0 paths p
+    paths="$(sqlite3 "$DB" "SELECT path FROM retag_queue ORDER BY attempts ASC, queued_at ASC LIMIT ${limit};" 2>/dev/null || true)"
+    [ -z "$paths" ] && return 0
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        # >&2: attempt output (write_log echoes) must not pollute the count
+        if retag_attempt "$p" >&2; then
+            ok=$((ok + 1))
+        fi
+    done <<< "$paths"
+    echo "$ok"
+}
+
+# Interactive retag view/retry (panel [7] / `retag` command).
+do_retag() {
+    init_db
+    load_immich_config
+    echo ""
+    if ! immich_configured; then
+        echo -e "${YELLOW}[SKIP] Immich is not configured - nothing to retag.${NC}"
+        return 0
+    fi
+    local pending rows
+    pending="$(retag_pending_count)"
+    if [ "${pending:-0}" -eq 0 ]; then
+        echo -e "${GREEN}[OK] Retag queue empty - every uploaded file has a successful tag attempt.${NC}"
+        return 0
+    fi
+    echo -e "${CYAN}  Retag queue: ${pending} file(s) whose tag attempt(s) failed${NC}"
+    echo "    path | attempts | last attempt | reason"
+    rows="$(sqlite3 "$DB" "SELECT path || ' | ' || attempts || ' | ' || COALESCE(last_attempt,'-') || ' | ' || COALESCE(last_reason,'-') FROM retag_queue ORDER BY attempts ASC, queued_at ASC;" 2>/dev/null || true)"
+    while IFS= read -r rows_line; do
+        [ -z "$rows_line" ] && continue
+        echo "    $rows_line"
+    done <<< "$rows"
+    local ans
+    read -rp "Retry tagging these ${pending} file(s) now? [y/N]: " ans
+    case "$ans" in
+        y|Y|yes|Yes)
+            local ok
+            ok="$(drain_retag "$pending")"
+            ok="${ok//[^0-9]/}"
+            ok="${ok:-0}"
+            echo -e "${GREEN}[OK] Retag pass finished: ${ok} succeeded, $((pending - ok)) still queued.${NC}"
+            ;;
+        *) echo "  Skipped." ;;
+    esac
+    return 0
+}
+
 immich_mark_uploaded() {
     local fpath="$1"
     if ! immich_configured; then
@@ -286,8 +372,24 @@ immich_mark_uploaded() {
         write_log "Immich: could not resolve tag '$GU_IMMICH_TAG': $fname" "WARN"
         return 1
     fi
-    immich_api PUT "/api/tags/${tag_id}/assets" "{\"ids\":[\"${asset_id//\"/\\\"}\"]}" >/dev/null
-    write_log "Immich | tagged as '$GU_IMMICH_TAG': $fname" "OK"
+    # Verify the tag PUT actually succeeded - an unnoticed 4xx/5xx would
+    # otherwise be reported as OK and never enter the retag queue.
+    local http_code
+    http_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X PUT \
+        -H "x-api-key: ${GU_IMMICH_API_KEY}" \
+        -H "Content-Type: application/json" \
+        -d "{\"ids\":[\"${asset_id//\"/\\\"}\"]}" \
+        "${GU_IMMICH_URL%/}/api/tags/${tag_id}/assets" 2>/dev/null)"
+    case "$http_code" in
+        200|201|204)
+            write_log "Immich | tagged as '$GU_IMMICH_TAG': $fname" "OK"
+            return 0
+            ;;
+        *)
+            write_log "Immich: tag PUT failed (HTTP ${http_code:-000}): $fname" "WARN"
+            return 1
+            ;;
+    esac
 }
 
 immich_check_uploaded() {
@@ -562,6 +664,19 @@ CREATE TABLE IF NOT EXISTS logs (
 
 CREATE INDEX IF NOT EXISTS idx_logs_ts    ON logs(timestamp);
 CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
+EOF
+
+    # Retag queue: files uploaded to Google Photos whose Immich tagging failed
+    # (typically 'asset not found' because Immich had not indexed the file yet).
+    # The watcher sweeps this periodically and `retag` retries manually.
+    sqlite3 "$DB" <<'EOF' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS retag_queue (
+    path         TEXT PRIMARY KEY,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    queued_at    TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+    last_attempt TEXT,
+    last_reason  TEXT
+);
 EOF
 
     # Dual-boot cross-platform tracking and content hash migration (BUG-05)
@@ -973,9 +1088,10 @@ do_logs() {
         echo -e "${GRAY}  --- live: new entries appear below. Press any key to stop tailing. ---${NC}"
         while true; do
             read -t 2 -N 1 -r new_rows
-            case "$new_rows" in
-                q|Q) echo ""; break ;;
-            esac
+            if [ -n "$new_rows" ]; then
+                echo ""    # any key stops tailing
+                break
+            fi
             while IFS='|' read -r ts lvl msg; do
                 [ -z "$ts" ] && continue
                 n_color="$GRAY"
@@ -1403,7 +1519,10 @@ EOF
         echo "  [####################] 100% [OK] Uploaded in ${duration}s: $fname (${size_mb} MB)"
         write_log "SUCCESS | $fname (${size_mb} MB in ${duration}s)" "OK"
         save_upload "$fpath" "$mkey" "$fname" "$size_bytes"
-        immich_mark_uploaded "$fpath" || true
+        if ! immich_mark_uploaded "$fpath"; then
+            save_retag "$fpath" "tag failed right after upload"
+            write_log "Queued for retag (will retry later): $fname" "WARN"
+        fi
     else
         echo "  [--------------------] FAILED in ${duration}s: $fname"
         local err_suffix=""
@@ -1631,6 +1750,14 @@ do_watch() {
         # Safety sweep for missed files every 900s (15 minutes)
         if [ $((now - last_sweep)) -ge 900 ]; then
             last_sweep=$now
+            # Drain the retag queue: uploads whose Immich tagging failed
+            # (e.g. asset not indexed yet) are retried here over time.
+            local retag_pending retag_ok
+            retag_pending="$(retag_pending_count)"
+            if [ "${retag_pending:-0}" -gt 0 ]; then
+                retag_ok="$(drain_retag 10)"
+                write_log "Retag sweep: attempted ${retag_pending} pending, ${retag_ok} now tagged, $((retag_pending - retag_ok)) remain" "INFO"
+            fi
             while IFS= read -r -d '' file; do
                 if is_media_file "$file"; then
                     local fname
@@ -2076,7 +2203,10 @@ for t in tags:
                     pth="${i#*| }"
                     grep -qxF -- "$pth" "$seen_file" 2>/dev/null && continue
                     echo "$pth" >> "$seen_file"
-                    immich_mark_uploaded "$pth" || true
+                    if ! immich_mark_uploaded "$pth"; then
+                        save_retag "$pth" "repair pass failed"
+                        echo -e "    ${YELLOW}-> queued for retag: $pth${NC}"
+                    fi
                 done
                 rm -f "$seen_file"
                 echo -e "${GREEN}[OK] Repair pass finished.${NC}"
@@ -2244,11 +2374,12 @@ do_panel() {
         echo "  [4] Throttle tuning (GU_DELAY_SECONDS / GU_DAILY_CAP)"
         echo "  [5] Dry-run scan (list only, no upload)"
         echo "  [6] Scrubber: re-upload files missing the Immich tag"
-        echo "  [7] Immich tag report & repair"
-        echo "  [8] Systemd service (enable / disable / status)"
+        echo "  [7] Retag queue: retry failed Immich tag attempts"
+        echo "  [8] Immich tag report & repair"
+        echo "  [9] Systemd service (enable / disable / status)"
         echo "  [0] Exit"
         echo -e "${CYAN}==========================================================${NC}"
-        read -rp "Select an option [0-8]: " choice
+        read -rp "Select an option [0-9]: " choice
         case "$choice" in
             1) panel_watcher_menu ;;
             2) do_dashboard; press_any_key ;;
@@ -2256,8 +2387,9 @@ do_panel() {
             4) do_tune; press_any_key ;;
             5) panel_dryrun; press_any_key ;;
             6) do_scrub; press_any_key ;;
-            7) do_immich_report; press_any_key ;;
-            8) panel_systemd_menu ;;
+            7) do_retag; press_any_key ;;
+            8) do_immich_report; press_any_key ;;
+            9) panel_systemd_menu ;;
             0) exit 0 ;;
             *) echo "Invalid option"; sleep 1 ;;
         esac
@@ -2317,6 +2449,7 @@ do_dashboard() {
     fi
     echo -e "  Watched folders  : $(gu_media_total 2>/dev/null) media files total; remainder=${remainder}"
     echo -e "  Retry queue      : ${retries} pending"
+    echo -e "  Retag queue      : $(retag_pending_count) pending (Immich tag retries)"
     if immich_configured; then
         echo -e "  Immich           : configured (${GU_IMMICH_URL}), tag '${GU_IMMICH_TAG}'"
     else
@@ -2414,6 +2547,7 @@ show_help() {
     echo "                      / scrubber / Immich tag report / systemd service)"
     echo "  scrub             Scrub watched folders: force re-upload every file"
     echo "                      missing the Immich 'gphotos-uploaded' tag"
+    echo "  retag             Retry Immich tagging for files whose tag attempt failed"
     echo "  menu              Open interactive terminal menu"
     echo "  help              Show this help message"
 }
@@ -2458,6 +2592,9 @@ case "$CMD" in
         ;;
     scrub|--scrub)
         do_scrub
+        ;;
+    retag|--retag)
+        do_retag
         ;;
     tune)
         init_db
