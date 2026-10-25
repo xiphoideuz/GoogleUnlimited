@@ -948,7 +948,7 @@ do_logs() {
     echo -e "${GRAY}  Database: $DB${NC}"
     echo -e "${CYAN}==========================================================${NC}"
 
-    local log_rows
+    local log_rows last_id=0 new_rows n_color ts lvl msg just_read
     log_rows=$(sqlite3 "$DB" "SELECT timestamp, level, message FROM (SELECT id, timestamp, level, message FROM logs ORDER BY id DESC LIMIT 30) ORDER BY id ASC;" 2>/dev/null || true)
 
     if [ -n "$log_rows" ]; then
@@ -966,6 +966,30 @@ do_logs() {
     fi
 
     echo -e "${CYAN}==========================================================${NC}"
+
+    # Live tail: stream new log entries as they appear (interactive only).
+    if [ -t 0 ]; then
+        last_id="$(sqlite3 "$DB" "SELECT COALESCE(MAX(id),0) FROM logs;" 2>/dev/null || echo 0)"
+        echo -e "${GRAY}  --- live: new entries appear below. Press any key to stop tailing. ---${NC}"
+        while true; do
+            read -t 2 -N 1 -r new_rows
+            case "$new_rows" in
+                q|Q) echo ""; break ;;
+            esac
+            while IFS='|' read -r ts lvl msg; do
+                [ -z "$ts" ] && continue
+                n_color="$GRAY"
+                case "$lvl" in
+                    "OK")    n_color="$GREEN" ;;
+                    "WARN")  n_color="$YELLOW" ;;
+                    "ERROR") n_color="$RED" ;;
+                esac
+                echo -e "[$ts][${n_color}$lvl${NC}] $msg"
+            done < <(sqlite3 "$DB" "SELECT timestamp, level, replace(message, char(10), ' ') FROM logs WHERE id > ${last_id} ORDER BY id ASC;" 2>/dev/null)
+            just_read="$(sqlite3 "$DB" "SELECT COALESCE(MAX(id),${last_id}) FROM logs;" 2>/dev/null || echo "$last_id")"
+            last_id="$just_read"
+        done
+    fi
     echo ""
 }
 
@@ -2325,43 +2349,51 @@ panel_systemd_menu() {
 # INTERACTIVE TERMINAL MENU
 # ---------------------------------------------------------------------
 show_menu() {
-    clear 2>/dev/null || true
-    echo -e "${CYAN}==========================================================${NC}"
-    echo -e "${GREEN}  *  GoogleUnlimited - Unix Manager ($OS)${NC}"
-    echo -e "${CYAN}==========================================================${NC}"
-    # Live status bar on the first page, same as the control panel page.
-    { init_db 2>/dev/null; load_gu_config 2>/dev/null; load_immich_config 2>/dev/null; gu_status_bar; } || true
-    echo "  [1] Start Live Watcher (Foreground)"
-    echo "  [2] Check Backup Status"
-    echo "  [3] View Activity Logs"
-    echo "  [4] Run Setup & Dependency Installer"
-    if [ "$OS" = "Darwin" ]; then
-        echo "  [5] Enable Auto-Start on Boot (macOS launchd)"
-    else
-        echo "  [5] Enable Auto-Start on Boot (Linux systemd)"
-    fi
-    echo "  [6] Disable Auto-Start on Boot"
-    echo "  [7] Stop Background Watcher"
-    echo "  [8] Verify Binary Integrity"
-    echo "  [9] Control Panel (status bar, tuning, dry-run, scrubber, Immich report)"
-    echo "  [0] Exit"
-    echo -e "${CYAN}==========================================================${NC}"
-    read -rp "Select an option [0-9, Default: 1]: " choice
-    choice="${choice:-1}"
+    { init_db 2>/dev/null; load_gu_config 2>/dev/null; load_immich_config 2>/dev/null; } || true
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}==========================================================${NC}"
+        echo -e "${GREEN}  *  GoogleUnlimited - Unix Manager ($OS)${NC}"
+        echo -e "${CYAN}==========================================================${NC}"
+        # Live status bar on the first page, same as the control panel page.
+        gu_status_bar || true
+        echo "  --- Watcher (run-time control) ---"
+        echo "  [1] Start Live Watcher (Foreground)"
+        echo "  [2] Stop Background Watcher"
+        echo "  --- Backup info ---"
+        echo "  [3] Check Backup Status"
+        echo "  [4] View Activity Logs (last 30, then live tail)"
+        echo "  --- Auto-start (boot/persistence) ---"
+        if [ "$OS" = "Darwin" ]; then
+            echo "  [5] Enable Auto-Start on Boot (macOS launchd)"
+        else
+            echo "  [5] Enable Auto-Start on Boot (Linux systemd)"
+        fi
+        echo "  [6] Disable Auto-Start on Boot"
+        echo "  --- Maintenance ---"
+        echo "  [7] Run Setup & Dependency Installer"
+        echo "  [8] Verify Binary Integrity"
+        echo "  [9] Control Panel (status bar, tuning, dry-run, scrubber, Immich report)"
+        echo "  [0] Exit"
+        echo -e "${CYAN}==========================================================${NC}"
+        read -rp "Select an option [0-9, Default: 1]: " choice
+        choice="${choice:-1}"
+        echo ""
 
-    case "$choice" in
-        1) confirm_start_watcher && do_watch ;;
-        2) do_status; press_any_key ;;
-        3) do_logs; press_any_key ;;
-        4) do_setup ;;
-        5) do_enable_startup ;;
-        6) do_disable_startup ;;
-        7) do_stop ;;
-        8) do_verify; press_any_key ;;
-        9) do_panel ;;
-        0) exit 0 ;;
-        *) echo "Invalid option"; sleep 1; show_menu ;;
-    esac
+        case "$choice" in
+            1) confirm_start_watcher && do_watch; press_any_key ;;
+            2) do_stop; press_any_key ;;
+            3) do_status; press_any_key ;;
+            4) do_logs; press_any_key ;;
+            5) do_enable_startup; press_any_key ;;
+            6) do_disable_startup; press_any_key ;;
+            7) do_setup; press_any_key ;;
+            8) do_verify; press_any_key ;;
+            9) do_panel ;;
+            0) exit 0 ;;
+            *) echo "Invalid option"; sleep 1 ;;
+        esac
+    done
 }
 
 show_help() {
