@@ -1658,6 +1658,54 @@ do_watch() {
     load_gu_config
     load_immich_config
 
+    # ---- Singleton gate (restart, don't duplicate) ----
+    # Never run two uploaders: duplicates multiply the rate N-fold and race
+    # each other's dedup checks (duplicate Google uploads, lost tags).
+    local _gate_mainpid=""
+    _gate_mainpid="$(gu_systemd_mainpid)"
+    if [ -n "$_gate_mainpid" ] && ! kill -0 "$_gate_mainpid" 2>/dev/null; then
+        _gate_mainpid=""   # stale property during a service restart
+    fi
+    if [ -n "$_gate_mainpid" ] && [ "$_gate_mainpid" != "$$" ]; then
+        echo -e "${YELLOW}  [gate] The systemd service already owns the watcher (pid ${_gate_mainpid}).${NC}" >&2
+        echo -e "  Nothing started. Recycle it instead:  systemctl --user restart $SERVICE_NAME" >&2
+        echo -e "  or use the panel watcher menu [4] Restart." >&2
+        write_log "GATE | refused a manual watcher start while systemd instance (pid $_gate_mainpid) runs" "WARN"
+        return 1
+    fi
+    local _gate_others
+    _gate_others="$(gu_watcher_roots | awk -v self="$$" '$1 != self')"
+    if [ -n "$_gate_others" ]; then
+        echo -e "${YELLOW}  Existing watcher instance(s):${NC}" >&2
+        printf '  %s\n' "$_gate_others" >&2
+        if [ "${GU_ALLOW_MULTI:-0}" = "1" ]; then
+            echo -e "${YELLOW}  GU_ALLOW_MULTI=1 set - starting a second instance anyway (not recommended).${NC}" >&2
+        elif { [ -t 0 ] && [ "${GU_AUTO_TRIM:-0}" != "1" ]; }; then
+            local _ans
+            read -rp "Trim the other(s) and take over as the single watcher? [y/N]: " _ans
+            case "$_ans" in
+                y|Y|yes|Yes) : ;;
+                *) echo "  Cancelled - keeping the existing watcher." >&2
+                   write_log "GATE | manual start declined; existing watcher kept" "INFO"
+                   return 1 ;;
+            esac
+        fi
+        printf '%s\n' "$_gate_others" | awk '{print $1}' | while IFS= read -r _p; do
+            echo -e "  Trimming existing instance pid $_p ..." >&2
+            kill -TERM "$_p" 2>/dev/null || true
+        done
+        sleep 3
+        printf '%s\n' "$_gate_others" | awk '{print $1}' | while IFS= read -r _p; do
+            if kill -0 "$_p" 2>/dev/null; then
+                kill -9 "$_p" 2>/dev/null || true
+                write_log "TRIM | startup takeover force-killed watcher pid $_p" "WARN"
+            else
+                write_log "TRIM | startup takeover replaced watcher pid $_p" "OK"
+            fi
+        done
+    fi
+    # ---- end singleton gate ----
+
     # Check credentials (skipped in dry-run mode)
     local creds_check="*dryrun*"
     if [ "$GU_DRY_RUN" = "1" ]; then
@@ -1949,44 +1997,320 @@ gu_watch_dirs() {
     fi
 }
 
-# One-line watcher state: PID file check + systemd user service status
-# + real process-instance count (the PID file can be removed by whichever
-# instance exits last, so processes are the source of truth here).
-gu_state() {
-    local state="STOPPED"
-    local -a inst=()
-    if command -v pgrep >/dev/null 2>&1; then
-        mapfile -t inst < <(pgrep -f 'google-unlimited\.sh watch' 2>/dev/null)
-    fi
-    if [ ${#inst[@]} -eq 1 ]; then
-        state="RUNNING (pid ${inst[0]})"
-    elif [ ${#inst[@]} -gt 1 ]; then
-        state="RUNNING (${#inst[@]} instances - dedup applies, consider stopping extras)"
-    fi
+# ---- Watcher singleton machinery -------------------------------------
+# pgrep alone over-counts and can be fooled by unrelated processes whose
+# cmdline merely CONTAINS the string (a one-liner, a grep command, ...).
+# A process counts as a watcher instance only when its cmdline tokens read
+# literally:  <something> .../google-unlimited.sh watch
+GU_WATCHER_PAT='google-unlimited\.sh[[:space:]]+watch'
+
+gu_cmd_is_watcher() {
+    # $1 = pid; exit 0 if that pid's cmdline is <shell> <path>/google-unlimited.sh watch
+    [ -r "/proc/$1/cmdline" ] || return 1
+    local -a toks=()
+    mapfile -t toks < <(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null)
+    local i base
+    for i in "${!toks[@]}"; do
+        [ "$i" -eq 0 ] && continue   # argv0 is never the script path under #!
+        base="${toks[$i]##*/}"
+        if [ "$base" = "google-unlimited.sh" ] \
+           && [ "${toks[$((i + 1))]:-}" = "watch" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+gu_watcher_roots() {
+    # Prints "pid etimes" (oldest last) for every real watcher instance.
+    local pids p ppid et
+    pids="$(pgrep -f "$GU_WATCHER_PAT" 2>/dev/null || true)"
+    [ -z "$pids" ] && return 0
+    for p in $pids; do
+        gu_cmd_is_watcher "$p" || continue
+        ppid="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+        case "$ppid" in ''|*[!0-9]*) continue ;; esac
+        if printf '%s\n' $pids | grep -qx -- "$ppid"; then
+            continue   # child of another watcher process -> same instance
+        fi
+        et="$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+        echo "$p ${et:-0}"
+    done
+}
+
+gu_systemd_mainpid() {
     if command -v systemctl >/dev/null 2>&1 \
        && systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        systemctl --user show "$SERVICE_NAME" -p MainPID --value 2>/dev/null
+    fi
+}
+
+# One-line watcher state: PID file check + systemd user service status
+# + REAL instance count (top-level roots, not forked subshells).
+gu_state() {
+    local state="STOPPED" roots n root_pid
+    roots="$(gu_watcher_roots)"
+    n="$(printf '%s\n' "$roots" | grep -c .)"
+    if [ "$n" -eq 1 ]; then
+        root_pid="$(printf '%s' "$roots" | awk '{print $1}')"
+        state="RUNNING (pid $root_pid)"
+    elif [ "$n" -gt 1 ]; then
+        state="RUNNING ($n instances - use panel [5] trim)"
+    fi
+    if [ -n "$(gu_systemd_mainpid)" ]; then
         state="${state} [systemd:active]"
     fi
     echo "$state"
 }
 
-# Gatekeeper for manual starts: confirm starting a second instance when a
-# watcher already runs. Duplicate watchers bypass the throttle pacing between
-# them, so users should see a warning and explicitly opt in.
+# Gatekeeper for manual starts: systemd owns the watcher (single confirmed
+# instance); starting another outright is refused - "restart, don't
+# duplicate". When non-systemd strays exist, the user can replace them.
 confirm_start_watcher() {
-    local state
+    local state mainpid ans
+    mainpid="$(gu_systemd_mainpid)"
+    if [ -n "$mainpid" ]; then
+        echo -e "${YELLOW}The systemd service already owns the watcher (pid ${mainpid}), and extra${NC}"
+        echo -e "${YELLOW}instances would multiply the upload rate and risk duplicate uploads.${NC}"
+        echo -e "  Tip: to watch uploads live, panel [3] View activity logs tails the same DB."
+        echo -e "  To recycle it safely, use panel [4] Restart (stops, then starts one)."
+        return 1
+    fi
     state="$(gu_state)"
     case "$state" in
         RUNNING*)
-            echo -e "${YELLOW}A watcher is currently running: ${state}${NC}"
-            echo -e "  (Tip: to watch uploads live, panel [3] View activity logs tails the same DB.)"
-            local ans
-            read -rp "Proceed to start a new watcher? [y/N]: " ans
+            echo -e "${YELLOW}A watcher is already running: ${state}${NC}"
+            echo -e "  Keeping two uploaders doubles the upload rate and risks duplicates."
+            read -rp "Stop the existing one and start fresh (restart, not duplicate)? [y/N]: " ans
             case "$ans" in
-                y|Y|yes|Yes) return 0 ;;
-                *) echo "  Cancelled." ; return 1 ;;
+                y|Y|yes|Yes) export GU_AUTO_TRIM=1; return 0 ;;
+                *) echo "  Cancelled."; return 1 ;;
             esac ;;
         *) return 0 ;;
+    esac
+}
+
+# ---- Duplicate trimming ------------------------------------------------
+# Kill every real watcher instance except the keeper: the systemd MainPID
+# when the unit is active, otherwise the longest-running instance.
+do_trim_watchers() {
+    local roots keeper p trimmed=0 leaked=0
+    roots="$(gu_watcher_roots)"
+    local n
+    n="$(printf '%s\n' "$roots" | grep -c .)"
+    if [ "$n" -le 1 ]; then
+        if [ "$n" -eq 1 ]; then
+            echo -e "${GREEN}[OK] No duplicates: exactly 1 watcher instance ($(printf '%s' "$roots" | awk '{print $1}')).${NC}"
+        else
+            echo -e "${GREEN}[OK] No duplicates: no watcher is running.${NC}"
+        fi
+        return 0
+    fi
+    keeper="$(gu_systemd_mainpid)"
+    if [ -z "$keeper" ] || ! printf '%s\n' "$roots" | grep -q "^${keeper} "; then
+        # fall back: keep the longest-running root
+        keeper="$(printf '%s\n' "$roots" | sort -k2 -n | tail -1 | awk '{print $1}')"
+    fi
+    echo "  Instances found: $n - keeping $(printf '%s' "$roots" | awk -v k="$keeper" '$1==k{print "pid "$1" ("$2"s uptime)"}')"
+    printf '%s\n' "$roots" | awk '{print $1}' | while IFS= read -r p; do
+        [ "$p" = "$keeper" ] && continue
+        echo "    trimming duplicate: pid $p"
+        kill -TERM "$p" 2>/dev/null || true
+    done
+    sleep 3
+    printf '%s\n' "$roots" | awk '{print $1}' | while IFS= read -r p; do
+        [ "$p" = "$keeper" ] && continue
+        if kill -0 "$p" 2>/dev/null; then
+            kill -9 "$p" 2>/dev/null || true
+            write_log "TRIM | forced kill of stray watcher pid $p (keeper $keeper)" "WARN"
+        else
+            write_log "TRIM | duplicate watcher pid $p terminated (keeper $keeper)" "OK"
+        fi
+    done
+    sleep 1
+    roots="$(gu_watcher_roots)"
+    n="$(printf '%s\n' "$roots" | grep -c .)"
+    if [ "$n" -eq 1 ]; then
+        echo -e "${GREEN}[OK] Trim complete: single watcher remains (pid $(printf '%s' "$roots" | awk '{print $1}')).${NC}"
+    else
+        echo -e "${YELLOW}[WARN] After trim, $n instance(s) remain: ${roots//$'\n'/, }${NC}"
+    fi
+    return 0
+}
+
+# ---- Watchdog trim: systemd service that trims duplicates every cycle ----
+GU_TRIM_SERVICE="google-unlimited-trim.service"
+GU_TRIM_INTERVAL="${GU_TRIM_INTERVAL:-60}"
+
+# (Re)generate the standalone trim script watched by the service. It never
+# appears as 'google-unlimited.sh watch' in its own cmdline, and pgrep
+# excludes itself, so trimming can't kill the trimmer.
+gu_generate_trim_script() {
+    local dir="$SCRIPT_DIR"
+    {
+        echo '#!/usr/bin/env bash'
+        echo '# Auto-generated by google-unlimited.sh - duplicate-watcher watchdog.'
+        echo '# Recreate with: ./google-unlimited.sh trim (or panel watcher menu [6]).'
+        echo "SCRIPT_DIR='$dir'"
+        echo "INTERVAL=\"\${GU_TRIM_INTERVAL:-$GU_TRIM_INTERVAL}\""
+        cat <<'TRIMSCRIPT'
+DB="$SCRIPT_DIR/gphotos.db"
+LOG="$SCRIPT_DIR/.trim.log"
+SERVICE="google-unlimited.service"
+PAT='google-unlimited\.sh[[:space:]]+watch'
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+sql() { sqlite3 -cmd '.timeout 5000' "$DB" "$1" 2>/dev/null || true; }
+
+# Exact argv-token check: only <shell> .../google-unlimited.sh watch counts.
+# Raw pgrep -f would also match any process whose cmdline merely CONTAINS
+# that string (a one-liner, a grep, an editor session) and kill it.
+cmd_is_watcher() {
+    [ -r "/proc/$1/cmdline" ] || return 1
+    local -a toks=()
+    mapfile -t toks < <(tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null)
+    local i base
+    for i in "${!toks[@]}"; do
+        [ "$i" -eq 0 ] && continue   # argv0 is never the script path under #!
+        base="${toks[$i]##*/}"
+        if [ "$base" = "google-unlimited.sh" ] \
+           && [ "${toks[$((i + 1))]:-}" = "watch" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+trim_once() {
+    local pids p ppid mainpid keep="" i
+    pids="$(pgrep -f "$PAT" 2>/dev/null || true)"
+    [ -z "$pids" ] && return 0
+    declare -A inS=()
+    declare -a roots=() ets=()
+    for p in $pids; do cmd_is_watcher "$p" && inS[$p]=1; done
+    [ "${#inS[@]}" -eq 0 ] && return 0
+    for p in $pids; do
+        [ -n "${inS[$p]:-}" ] || continue
+        ppid="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d '[:space:]')"
+        case "$ppid" in ''|*[!0-9]*) continue ;; esac
+        [ -n "${inS[$ppid]:-}" ] && continue
+        roots+=("$p")
+        ets+=("$(ps -o etimes= -p "$p" 2>/dev/null | tr -d '[:space:]')")
+    done
+    [ "${#roots[@]}" -le 1 ] && return 0
+    if systemctl --user is-active --quiet "$SERVICE" 2>/dev/null; then
+        mainpid="$(systemctl --user show "$SERVICE" -p MainPID --value 2>/dev/null)"
+    fi
+    if [ -n "$mainpid" ] && [ -d "/proc/$mainpid" ]; then
+        for p in "${roots[@]}"; do
+            [ "$p" = "$mainpid" ] && { keep="$mainpid"; break; }
+        done
+    fi
+    if [ -z "$keep" ]; then
+        for i in "${!roots[@]}"; do
+            echo "${ets[$i]:-0} ${roots[$i]}"
+        done | sort -n | tail -1 | awk '{print $2}' > "$SCRIPT_DIR/.trim_keep.$$"
+        keep="$(cat "$SCRIPT_DIR/.trim_keep.$$")"
+        rm -f "$SCRIPT_DIR/.trim_keep.$$"
+    fi
+    [ -z "$keep" ] && return 0
+    for p in "${roots[@]}"; do
+        [ "$p" = "$keep" ] && continue
+        log "TRIM: duplicate watcher root $p terminated by watchdog (keeper $keep)"
+        sql "INSERT INTO logs(level,message) VALUES ('OK','TRIM | watchdog ended duplicate watcher pid $p (keeper $keep)');"
+        kill -TERM "$p" 2>/dev/null
+    done
+    sleep 3
+    for p in "${roots[@]}"; do
+        [ "$p" = "$keep" ] && continue
+        if kill -0 "$p" 2>/dev/null; then
+            log "TRIM: forced kill of duplicate watcher $p (keeper $keep)"
+            kill -9 "$p" 2>/dev/null
+        fi
+    done
+}
+
+sql_init() {
+    sqlite3 "$DB" <<'SQLEOF' 2>/dev/null || true
+CREATE TABLE IF NOT EXISTS retag_queue (path TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, queued_at TEXT NOT NULL DEFAULT (datetime('now','localtime')), last_attempt TEXT, last_reason TEXT);
+CREATE TABLE IF NOT EXISTS retag_ghosts (path TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, last_attempt TEXT, last_reason TEXT, ghosted_at TEXT NOT NULL DEFAULT (datetime('now','localtime')));
+SQLEOF
+}
+sql_init
+case "${1:-}" in
+    once) trim_once ;;
+    *) while true; do trim_once; sleep "$INTERVAL"; done ;;
+esac
+TRIMSCRIPT
+    } > "$SCRIPT_DIR/gu_trim.sh"
+    chmod +x "$SCRIPT_DIR/gu_trim.sh" 2>/dev/null || true
+}
+
+watchdog_status() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        echo "  Watchdog trim    : systemctl not available"; return 0
+    fi
+    if systemctl --user list-unit-files 2>/dev/null | grep -q "^${GU_TRIM_SERVICE}"; then
+        echo "  Watchdog trim    : $(systemctl --user is-enabled "$GU_TRIM_SERVICE" 2>/dev/null || echo disabled) / $(systemctl --user is-active "$GU_TRIM_SERVICE" 2>/dev/null || echo inactive)"
+        echo "  Unit             : $GU_TRIM_SERVICE (interval ${GU_TRIM_INTERVAL}s)"
+    else
+        echo "  Watchdog trim    : not installed (panel watcher menu [6] -> [1] to enable)"
+    fi
+    if [ -f "$SCRIPT_DIR/.trim.log" ]; then
+        echo "  Recent trims     : $(tail -3 "$SCRIPT_DIR/.trim.log" 2>/dev/null | tr '\n' ' | ')"
+    fi
+}
+
+do_watchdog_enable() {
+    gu_generate_trim_script
+    local unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$unit_dir" 2>/dev/null || true
+    {
+        echo "[Unit]"
+        echo "Description=GoogleUnlimited duplicate-watcher trim watchdog"
+        echo ""
+        echo "[Service]"
+        echo "Type=simple"
+        echo "Environment=GU_TRIM_INTERVAL=${GU_TRIM_INTERVAL}"
+        echo "ExecStart=/usr/bin/env bash ${SCRIPT_DIR}/gu_trim.sh loop"
+        echo "Restart=on-failure"
+        echo "RestartSec=10"
+        echo ""
+        echo "[Install]"
+        echo "WantedBy=default.target"
+    } > "$unit_dir/${GU_TRIM_SERVICE}"
+    systemctl --user daemon-reload 2>/dev/null || true
+    systemctl --user enable --now "$GU_TRIM_SERVICE" 2>/dev/null
+    echo -e "${GREEN}[OK] Watchdog trim enabled: ${GU_TRIM_SERVICE} (checks every ${GU_TRIM_INTERVAL}s).${NC}"
+    echo "  It auto-kills duplicate watcher instances; trims are logged to .trim.log"
+    echo "  and mirrored into the activity logs (panel [3])."
+}
+
+do_watchdog_disable() {
+    if systemctl --user list-unit-files 2>/dev/null | grep -q "^${GU_TRIM_SERVICE}"; then
+        systemctl --user disable --now "$GU_TRIM_SERVICE" 2>/dev/null
+        echo -e "${GREEN}[OK] Watchdog trim disabled and stopped.${NC}"
+    else
+        echo "  Watchdog trim is not installed."
+    fi
+}
+
+panel_watchdog_menu() {
+    echo ""
+    watchdog_status
+    echo "  --- Watchdog trim ---"
+    echo "  [1] Enable (systemd user service, auto-trims every ${GU_TRIM_INTERVAL}s)"
+    echo "  [2] Disable"
+    echo "  [3] Refresh status"
+    echo "  [0] Back"
+    echo "  [q] Quit"
+    local ch
+    read -rp "Select [0-3, q]: " ch
+    case "$ch" in
+        1) do_watchdog_enable ;;
+        2) do_watchdog_disable ;;
+        3) watchdog_status ;;
+        q|Q) exit 0 ;;
+        *) : ;;
     esac
 }
 
@@ -2515,17 +2839,22 @@ panel_watcher_menu() {
     echo "  [2] Start background watcher (silently)"
     echo "  [3] Stop background watcher"
     echo "  [4] Restart background watcher"
+    echo "  [5] Trim duplicate watcher instances (one-shot)"
+    echo "  [6] Watchdog trim: enable / disable / status"
     echo "  [0] Back"
     echo "  [q] Quit"
     local ch
-    read -rp "Select [0-4, q]: " ch
+    read -rp "Select [0-6, q]: " ch
     case "$ch" in
         1) confirm_start_watcher && do_watch ;;
-        2) confirm_start_watcher && \
-           (cd "$SCRIPT_DIR" && setsid nohup ./google-unlimited.sh watch >/dev/null 2>&1 &) \
-           && echo -e "${GREEN}[OK] Background watcher started.${NC}" ;;
+        2) GU_AUTO_TRIM=1 confirm_start_watcher && \
+           { export GU_AUTO_TRIM=1
+             (cd "$SCRIPT_DIR" && setsid nohup ./google-unlimited.sh watch >/dev/null 2>&1 &)
+             echo -e "${GREEN}[OK] Background watcher started (single instance guaranteed).${NC}" ; } ;;
         3) do_stop ;;
         4) panel_restart_watcher ;;
+        5) do_trim_watchers; press_any_key ;;
+        6) panel_watchdog_menu ;;
         q|Q) exit 0 ;;
         *) : ;;
     esac
@@ -2560,6 +2889,7 @@ do_dashboard() {
     if command -v systemctl >/dev/null 2>&1; then
         echo -e "  Systemd service  : $(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null)"
     fi
+    watchdog_status
 }
 
 panel_systemd_menu() {
@@ -2650,6 +2980,7 @@ show_help() {
     echo "  scrub             Scrub watched folders: force re-upload every file"
     echo "                      missing the Immich 'gphotos-uploaded' tag"
     echo "  retag             Retry Immich tagging for files whose tag attempt failed"
+    echo "  trim              Kill duplicate watcher instances (keep systemd's)"
     echo "  menu              Open interactive terminal menu"
     echo "  help              Show this help message"
 }
@@ -2694,6 +3025,12 @@ case "$CMD" in
         ;;
     scrub|--scrub)
         do_scrub
+        ;;
+    trim|--trim)
+        init_db
+        load_gu_config
+        load_immich_config
+        do_trim_watchers
         ;;
     retag|--retag)
         do_retag

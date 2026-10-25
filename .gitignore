@@ -1,27 +1,28 @@
-# Personal Database & State (DO NOT COMMIT)
-*.db
-*.db-wal
-*.db-shm
-gphotos.db
-watch_dirs.txt
-skill-first-workflow.md
-gemini.md
 
-# Authentication Credentials & Tokens (DO NOT COMMIT)
-gotohp.config
-*.config
-*.key
-*.token
-
-# Logs & Temporary Files
-*.log
-*.tmp
-*.bak
-
-# OS Metadata
-Thumbs.db
-ehthumbs.db
-Desktop.ini
 $RECYCLE.BIN/
+# Authentication Credentials & Tokens (DO NOT COMMIT)
+*.bak
+*.config
+*.db
+*.db-shm
+*.db-wal
+Desktop.ini
 .DS_Store
+ehthumbs.db
+gemini.md
+gotohp.config
+gphotos.db
+gu_trim.sh
 .immich_asset_map.tsv*
+*.key
+*.log
+# Logs & Temporary Files
+# OS Metadata
+# Personal Database & State (DO NOT COMMIT)
+skill-first-workflow.md
+Thumbs.db
+*.tmp
+*.token
+.trim_keep.*
+.trim.log
+watch_dirs.txt
