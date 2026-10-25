@@ -21,6 +21,26 @@ OS="${OS:-$(uname -s)}"
 GU_DELAY_SECONDS="${GU_DELAY_SECONDS:-10}"
 GU_DAILY_CAP="${GU_DAILY_CAP:-0}"
 GU_DRY_RUN="${GU_DRY_RUN:-0}"
+# Mark whether these were explicitly provided via environment (env values beat gu.config)
+_GU_ENV_DELAY="${GU_DELAY_SECONDS+_set-}"
+_GU_ENV_CAP="${GU_DAILY_CAP+_set-}"
+
+# Load persisted tuning values from gu.config (gitignored, chmod 600).
+# Environment variables always win over gu.config.
+load_gu_config() {
+    local cfg="$SCRIPT_DIR/gu.config"
+    [ -f "$cfg" ] || return 0
+    chmod 600 "$cfg" 2>/dev/null || true
+    local k v
+    while IFS='=' read -r k v; do
+        case "$k" in
+            GU_DELAY_SECONDS)
+                [ "$_GU_ENV_DELAY" = "_set-" ] || GU_DELAY_SECONDS="$(echo "$v" | tr -d '"' | xargs)" ;;
+            GU_DAILY_CAP)
+                [ "$_GU_ENV_CAP" = "_set-" ] || GU_DAILY_CAP="$(echo "$v" | tr -d '"' | xargs)" ;;
+        esac
+    done < "$cfg"
+}
 
 # Immich API integration (optional, configured via immich.config or environment)
 #   GU_IMMICH_URL      : Immich server base URL, e.g. http://localhost:2283
@@ -1386,6 +1406,7 @@ EOF
 # shellcheck disable=SC2120
 do_watch() {
     init_db
+    load_gu_config
     load_immich_config
 
     # Check credentials (skipped in dry-run mode)
@@ -1644,6 +1665,402 @@ do_creds() {
 }
 
 # ---------------------------------------------------------------------
+# CONTROL PANEL (menu [9] / `panel` command)
+# ---------------------------------------------------------------------
+# Expand shell-style environment variables for watch_dirs.txt entries.
+gu_watch_dirs() {
+    local dirs=()
+    local line
+    if [ -f "$SCRIPT_DIR/watch_dirs.txt" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="$(echo "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            line="$(expand_watch_path "$line")"
+            if [ -d "$line" ]; then
+                dirs+=("$(cd "$line" && pwd)")
+            fi
+        done < "$SCRIPT_DIR/watch_dirs.txt"
+    else
+        local folder
+        for folder in "$HOME/Pictures" "$HOME/Downloads" "$HOME/Google Photos" "$HOME/OneDrive/Pictures" "$HOME/Pictures/iCloud Photos/Photos"; do
+            [ -d "$folder" ] && dirs+=("$folder")
+        done
+    fi
+    if [ ${#dirs[@]} -gt 0 ]; then
+        printf '%s\n' "${dirs[@]}"
+    fi
+}
+
+# One-line watcher state: PID file check + systemd user service status
+# + real process-instance count (the PID file can be removed by whichever
+# instance exits last, so processes are the source of truth here).
+gu_state() {
+    local state="STOPPED"
+    local -a inst=()
+    if command -v pgrep >/dev/null 2>&1; then
+        mapfile -t inst < <(pgrep -f 'google-unlimited\.sh watch' 2>/dev/null)
+    fi
+    if [ ${#inst[@]} -eq 1 ]; then
+        state="RUNNING (pid ${inst[0]})"
+    elif [ ${#inst[@]} -gt 1 ]; then
+        state="RUNNING (${#inst[@]} instances - dedup applies, consider stopping extras)"
+    fi
+    if command -v systemctl >/dev/null 2>&1 \
+       && systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        state="${state} [systemd:active]"
+    fi
+    echo "$state"
+}
+
+# Count media files present on disk in the watched folders (fast via find + regex).
+gu_media_total() {
+    local total=0 d
+    while IFS= read -r d; do
+        [ -z "$d" ] && continue
+        local n
+        n="$(find "$d" -type f -iregex '.*\.\(jpg\|jpeg\|png\|heic\|heif\|webp\|gif\|bmp\|tiff\|tif\|svg\|ico\|jfif\|avif\|dng\|raw\|cr2\|cr3\|nef\|arw\|orf\|rw2\|pef\|srw\|raf\|mp4\|mov\|mkv\|avi\|m4v\|3gp\|3g2\|wmv\|webm\|mpg\|mpeg\|mts\|m2ts\|ts\|flv\|vob\)$' 2>/dev/null | wc -l)"
+        total=$((total + n))
+    done < <(gu_watch_dirs)
+    echo "$total"
+}
+
+# Render the status bar described by the panel spec.
+gu_status_bar() {
+    local state delay cap
+    state="$(gu_state)"
+    delay="$GU_DELAY_SECONDS"
+    cap="$GU_DAILY_CAP"
+    local cap_txt
+    if [[ "$cap" =~ ^[0-9]+$ ]] && [ "$cap" -gt 0 ]; then
+        cap_txt="$cap /day"
+    else
+        cap_txt="unlimited"
+    fi
+    echo -e "${CYAN}----------------------------------------------------------${NC}"
+    echo -e "Uploader status: ${YELLOW}${state}${NC} | GU_DELAY_SECONDS: ${delay}s | GU_DAILY_CAP: ${cap_txt}"
+    local total backed remainder
+    total="$(gu_media_total)"
+    backed="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads;" 2>/dev/null || echo 0)"
+    remainder=$((total - backed))
+    [ "$remainder" -lt 0 ] && remainder=0
+    echo -e "Total Immich photos: ${total} | Backed up: ${backed} | Remainder: ${remainder}"
+    if immich_configured; then
+        echo -e "Immich tag: '${GU_IMMICH_TAG}'  (tag display enabled in Immich UI)"
+    fi
+    echo -e "${CYAN}----------------------------------------------------------${NC}"
+}
+
+# Restart the watcher the right way for the current setup:
+# prefer the systemd user service when it exists, else relaunch a background instance.
+panel_restart_watcher() {
+    if command -v systemctl >/dev/null 2>&1 \
+       && systemctl --user list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}\.service"; then
+        if systemctl --user restart "$SERVICE_NAME" 2>/dev/null; then
+            echo -e "${GREEN}[OK] systemd service restarted (new values loaded).${NC}"
+            return 0
+        fi
+    fi
+    do_stop >/dev/null 2>&1
+    (cd "$SCRIPT_DIR" && setsid nohup ./google-unlimited.sh watch >/dev/null 2>&1 &)
+    echo -e "${GREEN}[OK] Watcher restarted with the new values.${NC}"
+}
+
+# Interactive throttle tuning with an explanatory help block (panel [4]).
+do_tune() {
+    echo ""
+    echo -e "${CYAN}----------------------------------------------------------${NC}"
+    echo -e "${CYAN}  Throttle Tuning Help${NC}"
+    echo -e "${CYAN}----------------------------------------------------------${NC}"
+    echo "  GU_DELAY_SECONDS"
+    echo "      Pause in SECONDS between every upload. This is the main"
+    echo "      safety knob: it paces the watcher so Google sees a normal,"
+    echo "      human-like backup rate instead of a bulk dump."
+    echo "        * Lower value  = faster uploads, higher risk of rate-limits"
+    echo "        * Higher value = slower, gentler (recommended when first"
+    echo "          backfilling a large library)"
+    echo "        * 0 disables the pause entirely (full speed, NOT recommended)"
+    echo "        * Examples: 15s ~ 240 files/hour, 10s ~ 350/h, 5s ~ 700/h"
+    echo "  GU_DAILY_CAP"
+    echo "      Maximum number of SUCCESSFUL uploads per calendar day."
+    echo "      Once the cap is reached, remaining files stay in the queue"
+    echo "      and are picked up again the next day (the 15-minute sweep"
+    echo "      keeps the queue alive but no uploads happen until the date"
+    echo "      rolls over)."
+    echo "        * 0 = no cap, upload continuously until done (default)"
+    echo "        * Use during the initial backfill of a huge library to"
+    echo "          spread it over multiple days, e.g. 2000"
+    echo "      Values are saved to gu.config (gitignored) and survive"
+    echo "      watcher restarts. Environment variables still override."
+    echo -e "${CYAN}----------------------------------------------------------${NC}"
+    echo -e "  Current: GU_DELAY_SECONDS=${GU_DELAY_SECONDS}s  |  GU_DAILY_CAP=${GU_DAILY_CAP} (0 = unlimited)"
+    echo ""
+
+    local new_delay new_cap
+    read -rp "New GU_DELAY_SECONDS [Enter = keep ${GU_DELAY_SECONDS}]: " new_delay
+    if [ -n "$new_delay" ]; then
+        while ! [[ "$new_delay" =~ ^[0-9]+$ ]]; do
+            echo -e "${RED}  Must be a whole number of seconds (0 or more).${NC}"
+            read -rp "New GU_DELAY_SECONDS [Enter = keep ${GU_DELAY_SECONDS}]: " new_delay
+            [ -z "$new_delay" ] && break
+        done
+        [ -n "$new_delay" ] && GU_DELAY_SECONDS="$new_delay"
+    fi
+    read -rp "New GU_DAILY_CAP [Enter = keep ${GU_DAILY_CAP}]: " new_cap
+    if [ -n "$new_cap" ]; then
+        while ! [[ "$new_cap" =~ ^[0-9]+$ ]]; do
+            echo -e "${RED}  Must be a whole number (0 = unlimited).${NC}"
+            read -rp "New GU_DAILY_CAP [Enter = keep ${GU_DAILY_CAP}]: " new_cap
+            [ -z "$new_cap" ] && break
+        done
+        [ -n "$new_cap" ] && GU_DAILY_CAP="$new_cap"
+    fi
+
+    printf 'GU_DELAY_SECONDS=%s\nGU_DAILY_CAP=%s\n' "$GU_DELAY_SECONDS" "$GU_DAILY_CAP" > "$SCRIPT_DIR/gu.config"
+    chmod 600 "$SCRIPT_DIR/gu.config" 2>/dev/null || true
+    echo -e "${GREEN}[OK] Saved to gu.config${NC}"
+    echo -e "  GU_DELAY_SECONDS=${GU_DELAY_SECONDS} | GU_DAILY_CAP=${GU_DAILY_CAP}"
+
+    local state
+    state="$(gu_state)"
+    if [[ "$state" == RUNNING* ]]; then
+        local ans
+        echo -e "${YELLOW}The running watcher still has the old values in memory.${NC}"
+        read -rp "Restart it now to apply the new values? [y/N]: " ans
+        case "$ans" in
+            y|Y|yes|Yes)
+                panel_restart_watcher
+                ;;
+            *) echo "  Keeping the old session; values apply on next start." ;;
+        esac
+    else
+        echo "  Watcher is not running; new values apply next time it starts."
+    fi
+}
+
+# Dry-run scan (panel [5]): list what WOULD sync, nothing is uploaded.
+panel_dryrun() {
+    echo ""
+    echo -e "${CYAN}[Dry-run] Scanning watched folders...${NC}"
+    "$SCRIPT_DIR/google-unlimited.sh" watch
+    local rc=$?
+    echo ""
+    if [ "$rc" -eq 0 ]; then
+        echo -e "${GREEN}[OK] Dry-run complete. Nothing was uploaded or modified.${NC}"
+    else
+        echo -e "${YELLOW}[WARN] Dry-run exited with code $rc.${NC}"
+    fi
+}
+
+# Immich tag coverage report + repair (panel [6]).
+# Walks the whole library ONCE via /api/search/metadata pagination
+# (page size fixed at 250 by Immich; page param honored, take/pageSize ignored),
+# building a path->tags map, then classifies every local upload:
+#   tagged / untagged / not found in Immich.
+do_immich_report() {
+    init_db
+    load_immich_config
+    echo ""
+    if ! immich_configured; then
+        echo -e "${YELLOW}[SKIP] Immich is not configured (${NC}immich.config${YELLOW}: GU_IMMICH_URL / GU_IMMICH_API_KEY).${NC}"
+        return 0
+    fi
+
+    local map_file
+    map_file="$(mktemp /tmp/opencode/immich_map.XXXXXX)"
+    local page=1 max_pages=0 last_processed=""
+    echo -n "Loading Immich library pages: "
+    while :; do
+        max_pages=$((max_pages + 1))
+        [ "$max_pages" -gt 400 ] && break   # safety cap: 400 pages ~ 100k assets
+        local resp next_page
+        resp="$(immich_api POST /api/search/metadata "{\"page\":${page},\"withArchived\":true}")"
+        [ -z "$resp" ] && break
+        next_page=""
+        printf '%s' "$resp" | python3 -c '
+import sys, json, io
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+assets = (d.get("assets") or {})
+items = assets.get("items") or []
+for a in items:
+    p = a.get("originalPath") or ""
+    tags = ",".join(t.get("name", "") for t in (a.get("tags") or []))
+    print(p.replace("\t", " ") + "\t" + tags)
+print("NEXTPAGE:" + str(assets.get("nextPage") or ""))
+' >> "$map_file" || break
+        next_page="$(grep -q 'NEXTPAGE:' "$map_file" && true)"
+        next_page="$(sed -n 's/^NEXTPAGE://p' "$map_file" | tail -1)"
+        sed -i 's/^NEXTPAGE:.*$//' "$map_file"
+        [ -z "$next_page" ] && break
+        page=$(($next_page))
+        echo -n "${page} "
+    done
+    echo ""
+    local lib_count
+    lib_count="$(grep -ct . "$map_file" 2>/dev/null || echo 0)"
+    echo -e "Immich library scanned: ${lib_count} asset path(s) over $((page - 1)) page(s)."
+
+    local total=0 tagged=0 gap_un=0 gap_nf=0
+    local -a gaps=()
+    local f mapped tagline rel
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ -f "$f" ] || continue
+        total=$((total + 1))
+        mapped="$(immich_map_path "$f")"
+        tagline="$(awk -F'\t' -v p="$mapped" '$1 == p {print $2; exit}' "$map_file")"
+        if [ -z "$tagline" ]; then
+            # fallback: match on the /library/ relative suffix
+            rel="$(printf '%s' "$mapped" | sed 's|^.*/library/||')"
+            if [ -n "$rel" ]; then
+                mapped="$(awk -F'\t' -v r="/library/${rel}" 'index($1, r) > 0 {print $1; exit}' "$map_file")"
+                [ -n "$mapped" ] && tagline="$(awk -F'\t' -v p="$mapped" '$1 == p {print $2; exit}' "$map_file")"
+            fi
+        fi
+        if [ -z "$mapped" ]; then
+            gaps+=("NOT-IN-IMMICH | $f")
+            gap_nf=$((gap_nf + 1))
+        elif [[ ",${tagline:-}," != *",${GU_IMMICH_TAG},"* ]]; then
+            gaps+=("UNTAGGED     | $f")
+            gap_un=$((gap_un + 1))
+        else
+            tagged=$((tagged + 1))
+        fi
+    done < <(sqlite3 "$DB" "SELECT path FROM uploads;" 2>/dev/null)
+    rm -f "$map_file"
+
+    echo -e "Uploaded (local DB): ${total}   Tagged: ${GREEN}${tagged}${NC}   Untagged: ${gap_un}   Not in Immich: ${gap_nf}"
+    if [ ${#gaps[@]} -gt 0 ]; then
+        local i
+        echo -e "${YELLOW}  Files uploaded but not (yet) reflected in Immich:${NC}"
+        for i in "${gaps[@]}"; do
+            echo "    - $i"
+        done
+        local ans
+        read -rp "Attempt to tag the untagged/missed file(s) now? [y/N]: " ans
+        case "$ans" in
+            y|Y|yes|Yes)
+                for i in "${gaps[@]}"; do
+                    [[ "$i" == NOT-IN-IMMICH* ]] && continue
+                    local pth
+                    pth="${i#*| }"
+                    immich_mark_uploaded "$pth" || true
+                done
+                echo -e "${GREEN}[OK] Repair pass finished.${NC}"
+                ;;
+            *) echo "  Skipped repair." ;;
+        esac
+    else
+        echo -e "${GREEN}[OK] Every uploaded file is tagged in Immich.${NC}"
+    fi
+    return 0
+}
+
+do_panel() {
+    init_db
+    load_gu_config
+    load_immich_config
+
+    while true; do
+        clear 2>/dev/null || true
+        echo -e "${CYAN}==========================================================${NC}"
+        echo -e "${GREEN}  *  GoogleUnlimited - Control Panel ($OS)${NC}"
+        echo -e "${CYAN}==========================================================${NC}"
+        gu_status_bar
+        echo "  [1] Watcher: start / stop / restart"
+        echo "  [2] Status dashboard"
+        echo "  [3] View activity logs"
+        echo "  [4] Throttle tuning (GU_DELAY_SECONDS / GU_DAILY_CAP)"
+        echo "  [5] Dry-run scan (list only, no upload)"
+        echo "  [6] Immich tag report & repair"
+        echo "  [7] Systemd service (enable / disable / status)"
+        echo "  [0] Exit"
+        echo -e "${CYAN}==========================================================${NC}"
+        read -rp "Select an option [0-7]: " choice
+        case "$choice" in
+            1) panel_watcher_menu ;;
+            2) do_dashboard ;;
+            3) do_logs; press_any_key ;;
+            4) do_tune; press_any_key ;;
+            5) panel_dryrun; press_any_key ;;
+            6) do_immich_report; press_any_key ;;
+            7) panel_systemd_menu ;;
+            0) exit 0 ;;
+            *) echo "Invalid option"; sleep 1 ;;
+        esac
+    done
+}
+
+press_any_key() {
+    echo ""
+    read -rp "Press Enter to return to the panel..." _
+}
+
+panel_watcher_menu() {
+    echo ""
+    echo -e "  Current state: $(gu_state)"
+    echo "  [1] Start live watcher (foreground, Ctrl+C to stop)"
+    echo "  [2] Start background watcher (silently)"
+    echo "  [3] Stop background watcher"
+    echo "  [4] Restart background watcher"
+    echo "  [0] Back"
+    local ch
+    read -rp "Select [0-4]: " ch
+    case "$ch" in
+        1) do_watch ;;
+        2) (cd "$SCRIPT_DIR" && setsid nohup ./google-unlimited.sh watch >/dev/null 2>&1 &)
+           echo -e "${GREEN}[OK] Background watcher started.${NC}" ;;
+        3) do_stop ;;
+        4) panel_restart_watcher ;;
+        *) : ;;
+    esac
+}
+
+do_dashboard() {
+    echo ""
+    echo -e "${CYAN}  --- Dashboard ---${NC}"
+    echo -e "  Watcher          : $(gu_state)"
+    echo -e "  Throttle         : GU_DELAY_SECONDS=${GU_DELAY_SECONDS}s, GU_DAILY_CAP=${GU_DAILY_CAP} (0 = unlimited), GU_DRY_RUN=${GU_DRY_RUN}"
+    local backed today retries total remainder
+    backed="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads;" 2>/dev/null || echo 0)"
+    today="$(sqlite3 "$DB" "SELECT COUNT(*) FROM uploads WHERE date(uploaded_at)=date('now','localtime');" 2>/dev/null || echo 0)"
+    retries="$(sqlite3 "$DB" "SELECT COUNT(*) FROM retry_queue;" 2>/dev/null || echo 0)"
+    total="$(gu_media_total)"
+    remainder=$((total - backed))
+    [ "$remainder" -lt 0 ] && remainder=0
+    echo -e "  Uploaded (DB)    : ${backed} total / ${today} today"
+    echo -e "  Watched folders  : $(gu_media_total 2>/dev/null) media files total; remainder=${remainder}"
+    echo -e "  Retry queue      : ${retries} pending"
+    if immich_configured; then
+        echo -e "  Immich           : configured (${GU_IMMICH_URL}), tag '${GU_IMMICH_TAG}'"
+    else
+        echo -e "  Immich           : not configured (tag features off)"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        echo -e "  Systemd service  : $(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null || echo inactive)"
+    fi
+}
+
+panel_systemd_menu() {
+    echo ""
+    echo "  [1] Enable auto-start on boot (systemd + linger)"
+    echo "  [2] Disable auto-start on boot"
+    echo "  [3] Service status"
+    echo "  [0] Back"
+    local ch
+    read -rp "Select [0-3]: " ch
+    case "$ch" in
+        1) do_enable_startup ;;
+        2) do_disable_startup ;;
+        3) if command -v systemctl >/dev/null 2>&1; then systemctl --user status "$SERVICE_NAME" --no-pager 2>/dev/null || echo -e "${YELLOW}Service not found.${NC}"; fi ;;
+        *) : ;;
+    esac
+}
+
+# ---------------------------------------------------------------------
 # INTERACTIVE TERMINAL MENU
 # ---------------------------------------------------------------------
 show_menu() {
@@ -1663,9 +2080,10 @@ show_menu() {
     echo "  [6] Disable Auto-Start on Boot"
     echo "  [7] Stop Background Watcher"
     echo "  [8] Verify Binary Integrity"
+    echo "  [9] Control Panel (status bar, tuning, dry-run, Immich report)"
     echo "  [0] Exit"
     echo -e "${CYAN}==========================================================${NC}"
-    read -rp "Select an option [0-8, Default: 1]: " choice
+    read -rp "Select an option [0-9, Default: 1]: " choice
     choice="${choice:-1}"
 
     case "$choice" in
@@ -1677,6 +2095,7 @@ show_menu() {
         6) do_disable_startup ;;
         7) do_stop ;;
         8) do_verify ;;
+        9) do_panel ;;
         0) exit 0 ;;
         *) echo "Invalid option"; sleep 1; show_menu ;;
     esac
@@ -1695,6 +2114,9 @@ show_help() {
     echo "  stop              Stop running background watcher instances"
     echo "  verify            Verify gotohp-cli binary integrity using trusted SHA-256"
     echo "  creds             Manage credentials securely (creds add / creds list)"
+    echo "  panel             Open interactive control panel (status bar"
+    echo "                      / watcher control / throttle tuning / dry-run"
+    echo "                      / Immich tag report / systemd service)"
     echo "  menu              Open interactive terminal menu"
     echo "  help              Show this help message"
 }
@@ -1733,6 +2155,14 @@ case "$CMD" in
     creds)
         shift
         do_creds "$@"
+        ;;
+    panel|--panel)
+        do_panel
+        ;;
+    tune)
+        init_db
+        load_gu_config
+        do_tune
         ;;
     menu|--menu)
         show_menu
